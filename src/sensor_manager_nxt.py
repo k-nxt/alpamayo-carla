@@ -20,7 +20,7 @@ from collections import deque
 
 
 # ---------------------------------------------------------------------------
-# Alpamayo camera-index mapping (must match ar1_model.py / training data)
+# Alpamayo camera-index mapping (must match model training configuration)
 # ---------------------------------------------------------------------------
 ALPAMAYO_CAMERA_INDEX = {
     "camera_cross_left_120fov": 0,

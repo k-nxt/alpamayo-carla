@@ -2,11 +2,8 @@
 """
 Run CARLA Alpamayo Agent (NXT)
 
-Uses the corrected *_nxt modules that properly integrate with the
-official alpamayo_r1 package.
-
 Usage:
-    # Activate the ar1_venv that has alpamayo_r1, transformers 4.57, carla 0.9.15
+    # Activate the venv that has alpamayo_r1, transformers, carla
     source /work/yasu/program/alpamayo/alpamayo/ar1_venv/bin/activate
 
     # Dummy mode (no GPU, for testing CARLA integration)
@@ -52,6 +49,10 @@ def main():
         "--inference-interval", type=int, default=4,
         help="Run inference every N simulation ticks (default 4 → 5 Hz at 20fps)",
     )
+    parser.add_argument(
+        "--no-display", action="store_true",
+        help="Disable pygame dashboard window",
+    )
     args = parser.parse_args()
 
     config = AgentConfig(
@@ -62,6 +63,7 @@ def main():
         model_name=args.model,
         max_speed_kmh=args.max_speed,
         inference_interval=args.inference_interval,
+        enable_display=not args.no_display,
     )
 
     with CarlaAlpamayoAgent(config) as agent:

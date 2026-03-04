@@ -1,13 +1,12 @@
 """
 CARLA Alpamayo Agent (NXT)
-Integrates NVIDIA Alpamayo-R1 VLA model with CARLA simulator.
 
-Key differences from original:
-- Collects temporal image frames (default 4) for Alpamayo context
-- Records ego pose history (16 steps × 0.1 s) required by the model
-- Converts CARLA world coordinates → rig frame (X fwd, Y left, Z up)
-- Uses a Pure-Pursuit trajectory follower to convert predicted waypoints
-  into CARLA VehicleControl (steering / throttle / brake)
+Autonomous driving agent that runs Alpamayo-R1 VLA inside CARLA.
+
+- Collects 4-camera temporal frames (default 4 per camera) for model context
+- Records ego pose history (16 steps × 0.1 s) in rig frame
+- Converts predicted trajectory waypoints into CARLA VehicleControl
+  via Pure-Pursuit steering + proportional speed control
 """
 
 import carla
@@ -21,6 +20,7 @@ from scipy.spatial.transform import Rotation
 
 from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
 from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER
+from .display_nxt import Display
 
 # ---------------------------------------------------------------------------
 # Constants (must match Alpamayo-R1 expectations)
@@ -65,6 +65,9 @@ class AgentConfig:
     # Control
     max_speed_kmh: float = 30.0
     lookahead_distance: float = 5.0   # pure-pursuit look-ahead (m)
+
+    # Display
+    enable_display: bool = True       # pygame dashboard window
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +218,7 @@ class CarlaAlpamayoAgent:
         self.sensor_manager: Optional[SensorManager] = None
         self.alpamayo: Optional[AlpamayoWrapper] = None
         self.follower: Optional[TrajectoryFollower] = None
+        self.display: Optional[Display] = None
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -287,6 +291,10 @@ class CarlaAlpamayoAgent:
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.config.sim_fps
         self.world.apply_settings(settings)
+
+        # Pygame display (optional)
+        if self.config.enable_display:
+            self.display = Display()
 
         print("Agent initialised successfully!")
 
@@ -402,6 +410,15 @@ class CarlaAlpamayoAgent:
             result[cam_name] = [f.image for f in all_cam_frames[cam_name]]
         return result
 
+    def _get_latest_camera_images(self) -> Dict[str, np.ndarray]:
+        """Get the most recent single image from each camera (for display)."""
+        images: Dict[str, np.ndarray] = {}
+        for cam_name in ALPAMAYO_CAMERA_ORDER:
+            frames = self.sensor_manager.get_buffered_frames(cam_name, count=1)
+            if frames:
+                images[cam_name] = frames[-1].image
+        return images
+
     # ==================================================================
     # Vehicle state
     # ==================================================================
@@ -513,12 +530,28 @@ class CarlaAlpamayoAgent:
 
         try:
             while self.is_running and self.inference_count < max_frames:
-                t0 = time.time()
-
                 self.world.tick()
                 output = self.step()
                 self.update_spectator()
 
+                # ── pygame display ──
+                if self.display is not None:
+                    state = self.get_vehicle_state()
+                    traj = output.trajectory_xy if output else None
+                    reasoning = output.reasoning if output else None
+                    self.display.tick(
+                        camera_images=self._get_latest_camera_images(),
+                        vehicle_state=state,
+                        trajectory_xy=traj,
+                        reasoning=reasoning,
+                        inference_count=self.inference_count,
+                        tick_count=self.tick_count,
+                    )
+                    if self.display.should_quit:
+                        print("Display closed – stopping.")
+                        break
+
+                # ── console log ──
                 if verbose and tick % 20 == 0:
                     st = self.get_vehicle_state()
                     cot = ""
@@ -541,6 +574,9 @@ class CarlaAlpamayoAgent:
 
     def cleanup(self) -> None:
         print("Cleaning up…")
+        if self.display:
+            self.display.close()
+            self.display = None
         if self.sensor_manager:
             self.sensor_manager.destroy_all()
         if self.vehicle and self.vehicle.is_alive:

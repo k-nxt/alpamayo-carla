@@ -1,11 +1,11 @@
 """
 Alpamayo Model Wrapper (NXT)
-Proper integration with NVIDIA Alpamayo-R1 VLA model using official alpamayo_r1 API.
 
-Key differences from original:
-- Uses AlpamayoR1.from_pretrained() instead of AutoModelForVision2Seq
-- Uses helper.get_processor() (Qwen3-VL base) instead of AutoProcessor on Alpamayo model
-- Input: 4 cameras × 4 frames (16 images) + ego history → Output: trajectory waypoints
+Loads NVIDIA Alpamayo-R1 VLA model via the alpamayo_r1 package and runs
+trajectory inference from multi-camera images + ego history.
+
+Input:  4 cameras × 4 temporal frames (16 images) + ego pose history
+Output: trajectory waypoints in rig frame + chain-of-thought reasoning
 """
 
 import torch
@@ -66,12 +66,10 @@ class AlpamayoWrapper:
             print(f"Loading Alpamayo model: {self.model_name}")
             print("This may take a few minutes (~22GB)...")
 
-            # Load with custom AlpamayoR1 class (NOT AutoModelForVision2Seq)
             self.model = AlpamayoR1.from_pretrained(
                 self.model_name, dtype=self.DTYPE
             ).to(self.device)
 
-            # Get processor from Qwen3-VL base model (NOT from Alpamayo model)
             self.processor = helper.get_processor(self.model.tokenizer)
 
             # Get number of output waypoints from model config
