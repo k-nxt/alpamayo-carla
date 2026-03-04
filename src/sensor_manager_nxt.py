@@ -146,16 +146,22 @@ class SensorManager:
         world: carla.World,
         vehicle: carla.Actor,
         frame_buffer_size: int = 32,
+        subsample_factor: int = 1,
     ):
         """
         Args:
             world: CARLA world instance.
             vehicle: Vehicle to attach sensors to.
             frame_buffer_size: Max frames to keep per camera (ring buffer).
+            subsample_factor: When retrieving frames for inference, pick every
+                Nth frame from the buffer so that temporal spacing matches the
+                model's training data.  E.g. at 20 FPS sim with factor=2,
+                selected frames are 0.1 s apart (matching 10 Hz training data).
         """
         self.world = world
         self.vehicle = vehicle
         self.blueprint_library = world.get_blueprint_library()
+        self.subsample_factor = max(1, subsample_factor)
 
         self.sensors: Dict[str, carla.Actor] = {}
         self.data_queues: Dict[str, queue.Queue] = {}
@@ -271,7 +277,12 @@ class SensorManager:
         count: int = 4,
     ) -> Optional[List[TimestampedFrame]]:
         """
-        Get the latest ``count`` frames from a single camera's ring buffer.
+        Get the latest ``count`` frames from a single camera's ring buffer,
+        applying ``subsample_factor`` to maintain the correct temporal spacing.
+
+        With ``subsample_factor=2`` and ``count=4``, this selects the newest
+        frame and then every 2nd frame going backwards, returning 4 frames
+        that are each ~0.1 s apart (at 20 FPS sim).
 
         Returns:
             List of TimestampedFrame (oldest first), or None if not
@@ -280,9 +291,22 @@ class SensorManager:
         if name not in self.frame_buffers:
             return None
         buf = self.frame_buffers[name]
-        if len(buf) < count:
+
+        # Minimum frames required with subsampling
+        min_required = (count - 1) * self.subsample_factor + 1
+        if len(buf) < min_required:
             return None
-        return list(buf)[-count:]
+
+        # Select frames: newest first, stepping back by subsample_factor
+        selected = []
+        idx = len(buf) - 1
+        for _ in range(count):
+            selected.append(buf[idx])
+            idx -= self.subsample_factor
+
+        # Return oldest-first order
+        selected.reverse()
+        return selected
 
     def get_all_camera_frames(
         self,

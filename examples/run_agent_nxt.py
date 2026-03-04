@@ -46,8 +46,12 @@ def main():
         help="Max speed in km/h",
     )
     parser.add_argument(
-        "--inference-interval", type=int, default=4,
-        help="Run inference every N simulation ticks (default 4 → 5 Hz at 20fps)",
+        "--inference-interval", type=int, default=1,
+        help="Run inference every N simulation ticks (default 1 → every tick)",
+    )
+    parser.add_argument(
+        "--sim-fps", type=float, default=10.0,
+        help="Simulation FPS (default 10.0 = 0.1s/tick, matching AR1 training)",
     )
     parser.add_argument(
         "--no-display", action="store_true",
@@ -62,6 +66,7 @@ def main():
         use_dummy_model=args.dummy,
         model_name=args.model,
         max_speed_kmh=args.max_speed,
+        sim_fps=args.sim_fps,
         inference_interval=args.inference_interval,
         enable_display=not args.no_display,
     )

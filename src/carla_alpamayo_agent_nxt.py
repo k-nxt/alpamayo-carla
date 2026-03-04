@@ -59,8 +59,8 @@ class AgentConfig:
     num_traj_samples: int = 1
 
     # Simulation
-    sim_fps: float = 20.0
-    inference_interval: int = 4   # run inference every N ticks
+    sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
+    inference_interval: int = 1   # run inference every tick (= every 0.1 s)
 
     # Control
     max_speed_kmh: float = 30.0
@@ -116,12 +116,14 @@ class TrajectoryFollower:
         if self.trajectory is None or len(self.trajectory) == 0:
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
 
+        traj = self.trajectory
+        traj_length = self._trajectory_length()
+
+        # ── Steering (pure pursuit) ──
         lookahead = self._find_lookahead_point()
         if lookahead is None:
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.5)
 
-        # -- Steering (pure pursuit) --
-        # Rig frame: X fwd, Y left.
         dx, dy = float(lookahead[0]), float(lookahead[1])
         dist = np.hypot(dx, dy)
 
@@ -130,23 +132,38 @@ class TrajectoryFollower:
         else:
             curvature = 2.0 * dy / (dist ** 2)
             steer_rad = np.arctan(curvature * self.wheelbase)
-            # Normalise to [-1, 1] assuming max steer ≈ 70 deg
             steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
             # Rig Y-left positive → CARLA steer-right positive ⇒ flip
             steer = -steer
 
-        # -- Throttle / brake (proportional speed control) --
+        # ── Speed target ──
+        # Use speed profile along the full trajectory, not just the first 1 s.
         desired_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
+
+        # If the trajectory is very short the model wants us to stop soon.
+        # Ramp desired speed down proportionally to remaining trajectory length.
+        stop_margin = self.lookahead_distance * 1.5  # begin slowing within this
+        if traj_length < stop_margin:
+            ratio = max(traj_length / stop_margin, 0.0)
+            desired_speed *= ratio
+
+        # ── Throttle / brake ──
         err = desired_speed - current_speed_ms
 
-        if err > 0.5:
+        if desired_speed < 0.3:
+            # Model wants a near-stop → brake firmly
+            throttle = 0.0
+            brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
+        elif err > 0.5:
             throttle = float(np.clip(err * 0.3, 0.0, 0.8))
             brake = 0.0
-        elif err < -1.0:
+        elif err < -0.5:
             throttle = 0.0
-            brake = float(np.clip(-err * 0.2, 0.0, 1.0))
+            brake = float(np.clip(-err * 0.3, 0.1, 1.0))
         else:
-            throttle = 0.2   # gentle cruise
+            # Cruise – proportional to desired speed so we don't push
+            # through a stop with constant throttle.
+            throttle = float(np.clip(desired_speed * 0.06, 0.05, 0.3))
             brake = 0.0
 
         return carla.VehicleControl(
@@ -156,6 +173,14 @@ class TrajectoryFollower:
         )
 
     # -- helpers --
+
+    def _trajectory_length(self) -> float:
+        """Total arc length of the stored trajectory (meters)."""
+        traj = self.trajectory
+        if traj is None or len(traj) < 2:
+            return 0.0
+        diffs = np.diff(traj, axis=0)
+        return float(np.sum(np.linalg.norm(diffs, axis=1)))
 
     def _find_lookahead_point(self) -> Optional[np.ndarray]:
         """Interpolate to find the point at ``lookahead_distance`` along the trajectory."""
@@ -182,14 +207,29 @@ class TrajectoryFollower:
         return traj[idx - 1] + frac * (traj[idx] - traj[idx - 1])
 
     def _estimate_desired_speed(self) -> float:
-        """Heuristic: average displacement over the first ~1 s of trajectory."""
+        """
+        Estimate desired speed from the trajectory's speed profile.
+
+        Uses the speed near the lookahead region rather than just the
+        first second, so deceleration commands are respected.
+        """
         traj = self.trajectory
         if traj is None or len(traj) < 2:
             return 0.0
-        n = min(10, len(traj))                       # ≈1 s at 10 Hz
-        diffs = np.diff(traj[:n], axis=0)
-        speeds = np.linalg.norm(diffs, axis=1) / self.dt
-        return float(np.mean(speeds))
+
+        diffs = np.diff(traj, axis=0)
+        seg_speeds = np.linalg.norm(diffs, axis=1) / self.dt  # per-segment speed
+
+        # Take the minimum of early speed and mid-trajectory speed.
+        # This ensures we respond to deceleration further along.
+        n = len(seg_speeds)
+        early = float(np.mean(seg_speeds[: min(5, n)]))          # first 0.5 s
+        mid   = float(np.mean(seg_speeds[min(5, n): min(20, n)])) if n > 5 else early
+        late  = float(np.mean(seg_speeds[min(20, n):])) if n > 20 else mid
+
+        # Use the minimum across the profile – if any section is slow,
+        # we should already be decelerating.
+        return min(early, mid, late)
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +300,18 @@ class CarlaAlpamayoAgent:
         return self.vehicle
 
     def setup_sensors(self) -> None:
-        self.sensor_manager = SensorManager(self.world, self.vehicle)
+        # subsample_factor: cameras fire every sim tick.
+        # At 10 FPS each tick is 0.1 s, matching AR1 training data → factor=1.
+        # If sim_fps is higher, subsample to maintain 0.1 s spacing.
+        target_frame_dt = HISTORY_TIME_STEP          # 0.1 s (10 Hz)
+        sim_dt = 1.0 / self.config.sim_fps
+        subsample_factor = max(1, round(target_frame_dt / sim_dt))
+
+        self.sensor_manager = SensorManager(
+            self.world,
+            self.vehicle,
+            subsample_factor=subsample_factor,
+        )
         self.sensor_manager.spawn_default_sensors()
 
     def load_alpamayo(self) -> None:
@@ -513,11 +564,15 @@ class CarlaAlpamayoAgent:
 
         # --- warm-up: collect enough sensor data & ego history ---
         step_interval = max(1, round(HISTORY_TIME_STEP * cfg.sim_fps))
+        subsample_factor = self.sensor_manager.subsample_factor
+        # Need enough frames for subsampled context: (ctx-1)*subsample + 1
+        min_cam_ticks = (cfg.context_length - 1) * subsample_factor + 2
         warmup_ticks = max(
-            cfg.context_length + 2,
+            min_cam_ticks,
             (NUM_HISTORY_STEPS - 1) * step_interval + 4,
         )
         print(f"Warming up for {warmup_ticks} ticks "
+              f"(subsample_factor={subsample_factor}) "
               f"to collect sensor data & ego history...")
         for _ in range(warmup_ticks):
             self.world.tick()
