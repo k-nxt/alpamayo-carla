@@ -92,6 +92,7 @@ class Display:
         reasoning: Optional[str] = None,
         inference_count: int = 0,
         tick_count: int = 0,
+        inference_time: float = 0.0,
     ) -> None:
         """
         Redraw one frame of the dashboard.
@@ -103,6 +104,7 @@ class Display:
             reasoning: latest chain-of-thought text.
             inference_count: total inference steps so far.
             tick_count: total simulation ticks so far.
+            inference_time: wall-clock seconds for the last inference call.
         """
         self._handle_events()
         if self.should_quit:
@@ -119,7 +121,7 @@ class Display:
         self._draw_cameras(camera_images)
 
         # ── HUD (bottom-left) ──
-        self._draw_hud(vehicle_state, inference_count, tick_count, fps)
+        self._draw_hud(vehicle_state, inference_count, tick_count, fps, inference_time)
 
         # ── BEV trajectory + reasoning (bottom-right) ──
         self._draw_bev(trajectory_xy)
@@ -188,6 +190,7 @@ class Display:
         inf_count: int,
         tick: int,
         fps: int,
+        inference_time: float = 0.0,
     ) -> None:
         x, y = 0, _BOTTOM_Y
         w, h = _HUD_W, _BOTTOM_H
@@ -199,6 +202,16 @@ class Display:
         lines.append((f"Speed    {speed:6.1f} km/h", _TEXT))
         lines.append((f"Tick     {tick:6d}", _TEXT))
         lines.append((f"Infer #  {inf_count:6d}", _ACCENT))
+
+        # Inference time with color coding
+        if inference_time > 0:
+            it_color = _GREEN if inference_time < 1.0 else (
+                (255, 200, 50) if inference_time < 3.0 else (255, 80, 80)
+            )
+            lines.append((f"Inf Time {inference_time:5.2f} s", it_color))
+        else:
+            lines.append((f"Inf Time     - s", _TEXT_DIM))
+
         lines.append((f"FPS      {fps:6d}", _GREEN if fps >= 15 else _TEXT))
 
         if state:

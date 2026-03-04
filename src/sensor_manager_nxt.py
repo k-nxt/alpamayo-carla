@@ -52,9 +52,18 @@ class TimestampedFrame:
 
 
 # Default camera image size – matches training data (1900×1080).
-# Lower resolution can be used at the cost of accuracy.
+# The Qwen3-VL processor internally resizes to MAX_PIXELS ≈ 196608,
+# so lower CARLA resolution saves rendering + data transfer without
+# changing the number of vision tokens the model processes.
 _CAM_W = "1900"
 _CAM_H = "1080"
+
+# Pre-defined resolution presets (name → (width, height))
+RESOLUTION_PRESETS = {
+    "full":   (1900, 1080),   # Training resolution
+    "half":   (960, 540),     # 1/4 pixels
+    "low":    (640, 360),     # Close to processor target
+}
 
 
 class SensorManager:
@@ -147,6 +156,7 @@ class SensorManager:
         vehicle: carla.Actor,
         frame_buffer_size: int = 32,
         subsample_factor: int = 1,
+        cam_resolution: Optional[tuple] = None,
     ):
         """
         Args:
@@ -157,11 +167,31 @@ class SensorManager:
                 Nth frame from the buffer so that temporal spacing matches the
                 model's training data.  E.g. at 20 FPS sim with factor=2,
                 selected frames are 0.1 s apart (matching 10 Hz training data).
+            cam_resolution: (width, height) tuple to override default camera
+                resolution.  Use ``RESOLUTION_PRESETS`` for convenience.
         """
         self.world = world
         self.vehicle = vehicle
         self.blueprint_library = world.get_blueprint_library()
         self.subsample_factor = max(1, subsample_factor)
+
+        # Apply resolution override — rebuild configs with new resolution
+        # to avoid mutating the class-level defaults.
+        # (carla.Transform is not pickle-able, so deepcopy won't work.)
+        if cam_resolution is not None:
+            w, h = cam_resolution
+            self.CAMERA_CONFIGS = {
+                name: SensorConfig(
+                    sensor_type=cfg.sensor_type,
+                    transform=cfg.transform,          # shared ref is fine (read-only)
+                    attributes={**cfg.attributes,
+                                "image_size_x": str(w),
+                                "image_size_y": str(h)},
+                )
+                for name, cfg in self.CAMERA_CONFIGS.items()
+            }
+            self.DEFAULT_CONFIGS = {**self.CAMERA_CONFIGS, **self.OTHER_CONFIGS}
+            print(f"Camera resolution overridden to {w}×{h}")
 
         self.sensors: Dict[str, carla.Actor] = {}
         self.data_queues: Dict[str, queue.Queue] = {}

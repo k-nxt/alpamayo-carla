@@ -97,6 +97,7 @@ class AlpamayoWrapper:
         ego_history_xyz: torch.Tensor,
         ego_history_rot: torch.Tensor,
         max_generation_length: int = 256,
+        diffusion_steps: Optional[int] = None,
     ) -> AlpamayoOutput:
         """
         Run Alpamayo inference.
@@ -156,6 +157,11 @@ class AlpamayoWrapper:
         # Move everything to device
         model_inputs = helper.to_device(model_inputs, self.device)
 
+        # Build diffusion kwargs if step count is overridden
+        diffusion_kwargs = None
+        if diffusion_steps is not None:
+            diffusion_kwargs = {"inference_step": diffusion_steps}
+
         # Run inference with autocast
         with torch.autocast(self.device, dtype=self.DTYPE):
             pred_xyz, pred_rot, extra = (
@@ -165,6 +171,7 @@ class AlpamayoWrapper:
                     temperature=self.temperature,
                     num_traj_samples=self.num_traj_samples,
                     max_generation_length=max_generation_length,
+                    diffusion_kwargs=diffusion_kwargs,
                     return_extra=True,
                 )
             )

@@ -50,6 +50,18 @@ def main():
         help="Max speed in km/h",
     )
     parser.add_argument(
+        "--max-gen-len", type=int, default=64,
+        help="VLM max generation tokens (default 64; 256 for full CoT)",
+    )
+    parser.add_argument(
+        "--diffusion-steps", type=int, default=5,
+        help="Flow-matching diffusion steps (default 5; original 10)",
+    )
+    parser.add_argument(
+        "--cam-res", type=str, default="full",
+        help="Camera resolution: 'full' (1900x1080), 'half' (960x540), 'low' (640x360), or 'WxH'",
+    )
+    parser.add_argument(
         "--inference-interval", type=int, default=1,
         help="Run inference every N simulation ticks (default 1 → every tick)",
     )
@@ -71,6 +83,9 @@ def main():
         use_dummy_model=args.dummy,
         model_name=args.model,
         max_speed_kmh=args.max_speed,
+        max_generation_length=args.max_gen_len,
+        diffusion_steps=args.diffusion_steps,
+        cam_resolution=args.cam_res,
         sim_fps=args.sim_fps,
         inference_interval=args.inference_interval,
         enable_display=not args.no_display,

@@ -19,7 +19,7 @@ from collections import deque
 from scipy.spatial.transform import Rotation
 
 from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
-from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER
+from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
 from .display_nxt import Display
 
 # ---------------------------------------------------------------------------
@@ -57,6 +57,9 @@ class AgentConfig:
     use_dummy_model: bool = False
     context_length: int = 4       # temporal image frames
     num_traj_samples: int = 1
+    max_generation_length: int = 64   # VLM max tokens (shorter = faster, CoT truncated)
+    diffusion_steps: int = 5          # Flow-matching denoising steps (default 10, 5 for speed)
+    cam_resolution: str = "full"      # Camera resolution: "full", "half", "low", or "WxH"
 
     # Simulation
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
@@ -79,7 +82,17 @@ class TrajectoryFollower:
 
     Converts Alpamayo's predicted trajectory (rig frame waypoints)
     into a CARLA ``VehicleControl``.
+
+    Because Alpamayo uses stochastic sampling (temperature, top-p),
+    consecutive inferences with near-identical inputs can produce
+    wildly different trajectories (long "go" vs. short "stop").
+    To prevent the vehicle from oscillating between throttle and brake,
+    the raw desired-speed is smoothed via an exponential moving average
+    (EMA) before being used for throttle/brake decisions.
     """
+
+    # EMA smoothing factor: lower → more smoothing, slower response.
+    SPEED_EMA_ALPHA = 0.3
 
     def __init__(
         self,
@@ -95,7 +108,9 @@ class TrajectoryFollower:
 
         self.trajectory: Optional[np.ndarray] = None
         self.headings: Optional[np.ndarray] = None
-        self._last_desired_speed: float = 0.0  # for debug display
+        self._raw_desired_speed: float = 0.0   # instant (before EMA)
+        self._last_desired_speed: float = 0.0  # smoothed (after EMA), for display
+        self._last_control: Optional[carla.VehicleControl] = None  # for logging
 
     def set_trajectory(
         self,
@@ -115,14 +130,18 @@ class TrajectoryFollower:
     def compute_control(self, current_speed_ms: float) -> carla.VehicleControl:
         """Compute vehicle control from stored trajectory."""
         if self.trajectory is None or len(self.trajectory) == 0:
-            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            self._last_control = ctrl
+            return ctrl
 
         traj_length = self._trajectory_length()
 
         # ── Steering (pure pursuit) ──
         lookahead = self._find_lookahead_point()
         if lookahead is None:
-            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.5)
+            ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.5)
+            self._last_control = ctrl
+            return ctrl
 
         dx, dy = float(lookahead[0]), float(lookahead[1])
         dist = np.hypot(dx, dy)
@@ -137,17 +156,30 @@ class TrajectoryFollower:
             steer = -steer
 
         # ── Speed target ──
-        # Use the near-term speed from the trajectory (what we should do NOW).
-        desired_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
+        raw_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
 
         # If trajectory is extremely short, the model wants us to stop.
         if traj_length < 0.5:
-            desired_speed = 0.0
+            raw_speed = 0.0
+
+        self._raw_desired_speed = raw_speed
+
+        # Smooth with EMA to dampen stochastic oscillation
+        alpha = self.SPEED_EMA_ALPHA
+        desired_speed = alpha * raw_speed + (1.0 - alpha) * self._last_desired_speed
+        self._last_desired_speed = desired_speed
 
         # ── Throttle / brake ──
         err = desired_speed - current_speed_ms
 
-        if desired_speed < 0.3:
+        # Use a stricter (lower) stop threshold at standstill.
+        # The stochastic model frequently produces near-zero trajectories
+        # even when it "wants" to go.  At standstill, only brake when the
+        # EMA is clearly near zero; while moving, use a higher threshold
+        # so the car can actually come to a stop when needed.
+        stop_threshold = 0.10 if current_speed_ms < 0.5 else 0.30
+
+        if desired_speed < stop_threshold:
             # Model wants a stop
             throttle = 0.0
             brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
@@ -168,13 +200,13 @@ class TrajectoryFollower:
             throttle = float(np.clip(desired_speed * 0.08, 0.1, 0.4))
             brake = 0.0
 
-        self._last_desired_speed = desired_speed  # expose for debug display
-
-        return carla.VehicleControl(
+        ctrl = carla.VehicleControl(
             throttle=throttle,
             steer=steer,
             brake=brake,
         )
+        self._last_control = ctrl
+        return ctrl
 
     # -- helpers --
 
@@ -266,6 +298,7 @@ class CarlaAlpamayoAgent:
         self.inference_count = 0
         self.tick_count = 0
         self.last_output: Optional[AlpamayoOutput] = None
+        self.last_inference_time: float = 0.0  # seconds (wall clock)
 
     # ==================================================================
     # Initialisation helpers
@@ -312,6 +345,23 @@ class CarlaAlpamayoAgent:
             print(f"Spawned vehicle: {bp.id} at {sp.location} (index={idx})")
             return self.vehicle
 
+    @staticmethod
+    def _parse_cam_resolution(value: str) -> Optional[tuple]:
+        """Parse camera resolution string → (w, h) tuple or None for default."""
+        if value == "full":
+            return None  # Use default 1900×1080
+        if value in RESOLUTION_PRESETS:
+            return RESOLUTION_PRESETS[value]
+        # Try "WxH" format
+        if "x" in value:
+            parts = value.split("x")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                return (int(parts[0]), int(parts[1]))
+        raise ValueError(
+            f"Invalid cam_resolution '{value}'. "
+            f"Use 'full', 'half', 'low', or 'WxH' (e.g. '640x360')."
+        )
+
     def setup_sensors(self) -> None:
         # subsample_factor: cameras fire every sim tick.
         # At 10 FPS each tick is 0.1 s, matching AR1 training data → factor=1.
@@ -320,10 +370,14 @@ class CarlaAlpamayoAgent:
         sim_dt = 1.0 / self.config.sim_fps
         subsample_factor = max(1, round(target_frame_dt / sim_dt))
 
+        # Parse camera resolution
+        cam_res = self._parse_cam_resolution(self.config.cam_resolution)
+
         self.sensor_manager = SensorManager(
             self.world,
             self.vehicle,
             subsample_factor=subsample_factor,
+            cam_resolution=cam_res,
         )
         self.sensor_manager.spawn_default_sensors()
 
@@ -520,6 +574,7 @@ class CarlaAlpamayoAgent:
             if cam_frames is not None and hist is not None:
                 ego_xyz, ego_rot = hist
 
+                t0 = time.perf_counter()
                 if self.config.use_dummy_model:
                     output = self.alpamayo.predict_dummy()
                 else:
@@ -527,7 +582,10 @@ class CarlaAlpamayoAgent:
                         camera_frames=cam_frames,
                         ego_history_xyz=ego_xyz,
                         ego_history_rot=ego_rot,
+                        max_generation_length=self.config.max_generation_length,
+                        diffusion_steps=self.config.diffusion_steps,
                     )
+                self.last_inference_time = time.perf_counter() - t0
 
                 self.last_output = output
                 self.follower.set_trajectory(
@@ -614,25 +672,32 @@ class CarlaAlpamayoAgent:
                         reasoning=reasoning,
                         inference_count=self.inference_count,
                         tick_count=self.tick_count,
+                        inference_time=self.last_inference_time,
                     )
                     if self.display.should_quit:
                         print("Display closed – stopping.")
                         break
 
                 # ── console log ──
-                if verbose and tick % 20 == 0:
+                if verbose:
                     st = self.get_vehicle_state()
-                    ctrl = self.vehicle.get_control()
+                    # Use _last_control (set inside compute_control) to avoid
+                    # the 1-tick lag of vehicle.get_control().
+                    ctrl = self.follower._last_control
+                    if ctrl is None:
+                        ctrl = carla.VehicleControl()
                     tl = self.follower._trajectory_length() if self.follower.trajectory is not None else 0.0
-                    ds = self.follower._last_desired_speed
+                    ds = self.follower._last_desired_speed      # EMA smoothed
+                    ds_raw = self.follower._raw_desired_speed    # instant (before EMA)
                     cot = ""
                     if output and output.reasoning:
                         cot = output.reasoning[:60].replace("\n", " ") + "…"
                     print(
-                        f"Tick {tick:5d} | Inf #{self.inference_count:4d} | "
+                        f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
+                        f"({self.last_inference_time:.2f}s) | "
                         f"Spd {st['speed_kmh']:5.1f} | "
                         f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} | "
-                        f"DesSpd {ds:.2f}m/s TrjL {tl:.1f}m | {cot}"
+                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m | {cot}"
                     )
                 tick += 1
 
