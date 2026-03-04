@@ -187,13 +187,16 @@ class TrajectoryFollower:
             # Model wants a stop
             throttle = 0.0
             brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
+        elif current_speed_ms < 0.5 and err > 0:
+            # At standstill with any positive speed target — apply enough
+            # throttle to overcome CARLA's static friction.  Even a small
+            # EMA desired speed (e.g. 0.15 m/s) means the model wants to
+            # move, so 0.1 cruise throttle is insufficient.
+            throttle = float(np.clip(err * 0.5, 0.35, 0.8))
+            brake = 0.0
         elif err > 0.3:
-            # Need to accelerate
-            # Stronger kick from standstill; CARLA needs ~0.4+ to overcome inertia
-            if current_speed_ms < 0.5:
-                throttle = float(np.clip(err * 0.5, 0.4, 0.8))
-            else:
-                throttle = float(np.clip(err * 0.3, 0.15, 0.8))
+            # Need to accelerate (already moving)
+            throttle = float(np.clip(err * 0.3, 0.15, 0.8))
             brake = 0.0
         elif err < -1.0:
             # Too fast – brake

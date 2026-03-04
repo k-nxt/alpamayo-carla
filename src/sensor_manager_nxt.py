@@ -76,13 +76,30 @@ class SensorManager:
     """
 
     # -- Camera configs matching Alpamayo's training rig ----------------
-    # Approximate positions on a sedan (Tesla Model 3 scale).
-    # "cross" cameras are angled ≈60° to the side.
+    # Positions derived from the NVIDIA Hyperion rig extrinsics:
+    #
+    #   Rig frame (origin = rear axle): X forward, Y left, Z up
+    #     front_wide : [1.670, -0.026, 1.523]
+    #     front_tele : co-located with front_wide (same mount, different lens)
+    #     cross_left : [1.646,  0.143, 1.521]
+    #     cross_right: [1.626, -0.162, 1.526]
+    #
+    #   CARLA frame: X forward, Y right, Z up.
+    #   The vehicle origin in CARLA is close to the rear axle, so we use
+    #   rig coordinates directly with only Y-axis inversion (rig Y+ left,
+    #   CARLA Y+ right).  All 4 cameras cluster near x ≈ 1.65 m, placing
+    #   them at the windshield / roof-line of a sedan — well ahead of the
+    #   vehicle body so the hood does not dominate the camera view.
+    #
+    #   Cross-camera yaw angles computed from rig_to_camera quaternions:
+    #     cross_left  ≈ −55° (looking left)
+    #     cross_right ≈ +55° (looking right)
+    # -----------------------------------------------------------------
     CAMERA_CONFIGS = {
         "camera_front_wide_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=2.0, z=1.4),
+                carla.Location(x=1.67, y=0.03, z=1.52),
                 carla.Rotation(pitch=0),
             ),
             attributes={
@@ -94,7 +111,7 @@ class SensorManager:
         "camera_front_tele_30fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=2.0, z=1.4),
+                carla.Location(x=1.67, y=0.03, z=1.52),
                 carla.Rotation(pitch=0),
             ),
             attributes={
@@ -106,8 +123,8 @@ class SensorManager:
         "camera_cross_left_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=0.5, y=-0.4, z=1.4),
-                carla.Rotation(yaw=-60),
+                carla.Location(x=1.65, y=-0.14, z=1.52),
+                carla.Rotation(yaw=-55),
             ),
             attributes={
                 "image_size_x": _CAM_W,
@@ -118,8 +135,8 @@ class SensorManager:
         "camera_cross_right_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=0.5, y=0.4, z=1.4),
-                carla.Rotation(yaw=60),
+                carla.Location(x=1.63, y=0.16, z=1.53),
+                carla.Rotation(yaw=55),
             ),
             attributes={
                 "image_size_x": _CAM_W,
