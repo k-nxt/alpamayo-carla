@@ -50,7 +50,7 @@ class AgentConfig:
 
     # Vehicle
     vehicle_filter: str = "vehicle.tesla.model3"
-    spawn_point_index: int = 0
+    spawn_point_index: int = -1   # -1 = random
 
     # Alpamayo model
     model_name: str = "nvidia/Alpamayo-R1-10B"
@@ -95,6 +95,7 @@ class TrajectoryFollower:
 
         self.trajectory: Optional[np.ndarray] = None
         self.headings: Optional[np.ndarray] = None
+        self._last_desired_speed: float = 0.0  # for debug display
 
     def set_trajectory(
         self,
@@ -116,7 +117,6 @@ class TrajectoryFollower:
         if self.trajectory is None or len(self.trajectory) == 0:
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
 
-        traj = self.trajectory
         traj_length = self._trajectory_length()
 
         # ── Steering (pure pursuit) ──
@@ -137,34 +137,38 @@ class TrajectoryFollower:
             steer = -steer
 
         # ── Speed target ──
-        # Use speed profile along the full trajectory, not just the first 1 s.
+        # Use the near-term speed from the trajectory (what we should do NOW).
         desired_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
 
-        # If the trajectory is very short the model wants us to stop soon.
-        # Ramp desired speed down proportionally to remaining trajectory length.
-        stop_margin = self.lookahead_distance * 1.5  # begin slowing within this
-        if traj_length < stop_margin:
-            ratio = max(traj_length / stop_margin, 0.0)
-            desired_speed *= ratio
+        # If trajectory is extremely short, the model wants us to stop.
+        if traj_length < 0.5:
+            desired_speed = 0.0
 
         # ── Throttle / brake ──
         err = desired_speed - current_speed_ms
 
         if desired_speed < 0.3:
-            # Model wants a near-stop → brake firmly
+            # Model wants a stop
             throttle = 0.0
             brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
-        elif err > 0.5:
-            throttle = float(np.clip(err * 0.3, 0.0, 0.8))
+        elif err > 0.3:
+            # Need to accelerate
+            # Stronger kick from standstill; CARLA needs ~0.4+ to overcome inertia
+            if current_speed_ms < 0.5:
+                throttle = float(np.clip(err * 0.5, 0.4, 0.8))
+            else:
+                throttle = float(np.clip(err * 0.3, 0.15, 0.8))
             brake = 0.0
-        elif err < -0.5:
+        elif err < -1.0:
+            # Too fast – brake
             throttle = 0.0
             brake = float(np.clip(-err * 0.3, 0.1, 1.0))
         else:
-            # Cruise – proportional to desired speed so we don't push
-            # through a stop with constant throttle.
-            throttle = float(np.clip(desired_speed * 0.06, 0.05, 0.3))
+            # Cruise – maintain speed with light throttle
+            throttle = float(np.clip(desired_speed * 0.08, 0.1, 0.4))
             brake = 0.0
+
+        self._last_desired_speed = desired_speed  # expose for debug display
 
         return carla.VehicleControl(
             throttle=throttle,
@@ -208,28 +212,22 @@ class TrajectoryFollower:
 
     def _estimate_desired_speed(self) -> float:
         """
-        Estimate desired speed from the trajectory's speed profile.
+        Estimate desired speed from the trajectory's total displacement.
 
-        Uses the speed near the lookahead region rather than just the
-        first second, so deceleration commands are respected.
+        Uses ``total_length / total_time`` — simple, robust, and avoids
+        the pitfall of early waypoints clustering near the origin when
+        the model predicts gradual acceleration.
         """
         traj = self.trajectory
         if traj is None or len(traj) < 2:
             return 0.0
 
-        diffs = np.diff(traj, axis=0)
-        seg_speeds = np.linalg.norm(diffs, axis=1) / self.dt  # per-segment speed
+        total_length = self._trajectory_length()
+        total_time = (len(traj) - 1) * self.dt   # e.g. 39 × 0.1 = 3.9 s
+        if total_time < 1e-6:
+            return 0.0
 
-        # Take the minimum of early speed and mid-trajectory speed.
-        # This ensures we respond to deceleration further along.
-        n = len(seg_speeds)
-        early = float(np.mean(seg_speeds[: min(5, n)]))          # first 0.5 s
-        mid   = float(np.mean(seg_speeds[min(5, n): min(20, n)])) if n > 5 else early
-        late  = float(np.mean(seg_speeds[min(20, n):])) if n > 20 else mid
-
-        # Use the minimum across the profile – if any section is slow,
-        # we should already be decelerating.
-        return min(early, mid, late)
+        return total_length / total_time
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +281,8 @@ class CarlaAlpamayoAgent:
         print(f"Map: {self.world.get_map().name}")
 
     def spawn_vehicle(self) -> carla.Actor:
+        import random
+
         bp_lib = self.world.get_blueprint_library()
         bps = bp_lib.filter(self.config.vehicle_filter)
         if not bps:
@@ -292,12 +292,25 @@ class CarlaAlpamayoAgent:
         spawns = self.world.get_map().get_spawn_points()
         if not spawns:
             raise RuntimeError("No spawn points available")
-        idx = min(self.config.spawn_point_index, len(spawns) - 1)
-        sp = spawns[idx]
 
-        self.vehicle = self.world.spawn_actor(bp, sp)
-        print(f"Spawned vehicle: {bp.id} at {sp.location}")
-        return self.vehicle
+        idx = self.config.spawn_point_index
+        if idx < 0:
+            # Random: try up to 10 different spawn points in case of collision
+            random.shuffle(spawns)
+            for sp in spawns[:10]:
+                try:
+                    self.vehicle = self.world.spawn_actor(bp, sp)
+                    print(f"Spawned vehicle: {bp.id} at {sp.location} (random)")
+                    return self.vehicle
+                except RuntimeError:
+                    continue
+            raise RuntimeError("Could not find a free spawn point")
+        else:
+            idx = min(idx, len(spawns) - 1)
+            sp = spawns[idx]
+            self.vehicle = self.world.spawn_actor(bp, sp)
+            print(f"Spawned vehicle: {bp.id} at {sp.location} (index={idx})")
+            return self.vehicle
 
     def setup_sensors(self) -> None:
         # subsample_factor: cameras fire every sim tick.
@@ -609,12 +622,17 @@ class CarlaAlpamayoAgent:
                 # ── console log ──
                 if verbose and tick % 20 == 0:
                     st = self.get_vehicle_state()
+                    ctrl = self.vehicle.get_control()
+                    tl = self.follower._trajectory_length() if self.follower.trajectory is not None else 0.0
+                    ds = self.follower._last_desired_speed
                     cot = ""
                     if output and output.reasoning:
-                        cot = output.reasoning[:80].replace("\n", " ") + "…"
+                        cot = output.reasoning[:60].replace("\n", " ") + "…"
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} | "
-                        f"Speed {st['speed_kmh']:5.1f} km/h | {cot}"
+                        f"Spd {st['speed_kmh']:5.1f} | "
+                        f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} | "
+                        f"DesSpd {ds:.2f}m/s TrjL {tl:.1f}m | {cot}"
                     )
                 tick += 1
 

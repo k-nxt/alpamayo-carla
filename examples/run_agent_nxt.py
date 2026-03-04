@@ -34,6 +34,10 @@ def main():
         help="Use dummy model (no GPU required)",
     )
     parser.add_argument(
+        "--spawn", type=int, default=-1,
+        help="Spawn point index (-1 = random, 0..N = fixed index)",
+    )
+    parser.add_argument(
         "--vehicle", default="vehicle.tesla.model3",
         help="Vehicle blueprint filter",
     )
@@ -62,6 +66,7 @@ def main():
     config = AgentConfig(
         host=args.host,
         port=args.port,
+        spawn_point_index=args.spawn,
         vehicle_filter=args.vehicle,
         use_dummy_model=args.dummy,
         model_name=args.model,
