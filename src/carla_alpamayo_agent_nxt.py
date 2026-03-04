@@ -72,6 +72,10 @@ class AgentConfig:
     # Display
     enable_display: bool = True       # pygame dashboard window
 
+    # Video recording
+    record_path: Optional[str] = None  # MP4 output path (None = no recording)
+    record_crf: int = 23              # H.264 CRF (0=lossless, 23=default, 51=worst)
+
 
 # ---------------------------------------------------------------------------
 # Trajectory → vehicle-control converter
@@ -412,7 +416,11 @@ class CarlaAlpamayoAgent:
 
         # Pygame display (optional)
         if self.config.enable_display:
-            self.display = Display()
+            self.display = Display(
+                record_path=self.config.record_path,
+                record_fps=self.config.sim_fps,
+                record_crf=self.config.record_crf,
+            )
 
         print("Agent initialised successfully!")
 

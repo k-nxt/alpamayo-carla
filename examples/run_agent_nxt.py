@@ -73,7 +73,20 @@ def main():
         "--no-display", action="store_true",
         help="Disable pygame dashboard window",
     )
+    parser.add_argument(
+        "--record", type=str, default=None, metavar="PATH",
+        help="Record the dashboard to an MP4 file (e.g. --record out.mp4)",
+    )
+    parser.add_argument(
+        "--crf", type=int, default=23,
+        help="H.264 CRF for recording (0=lossless, 23=default, 51=worst)",
+    )
     args = parser.parse_args()
+
+    # Recording requires the display to be enabled
+    if args.record and args.no_display:
+        print("Warning: --record requires the display. Enabling display.")
+        args.no_display = False
 
     config = AgentConfig(
         host=args.host,
@@ -89,6 +102,8 @@ def main():
         sim_fps=args.sim_fps,
         inference_interval=args.inference_interval,
         enable_display=not args.no_display,
+        record_path=args.record,
+        record_crf=args.crf,
     )
 
     with CarlaAlpamayoAgent(config) as agent:

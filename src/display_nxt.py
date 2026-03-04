@@ -7,10 +7,16 @@ Shows a real-time dashboard with:
   - Predicted trajectory in bird's-eye view
   - Latest chain-of-thought reasoning text
 
+Optional MP4 recording via ffmpeg (``record_path`` parameter).
+The video is written at the *simulation* FPS so that playback runs at
+the intended real-time speed regardless of how long inference takes.
+
 ESC or window close to quit.
 """
 
 import numpy as np
+import subprocess
+import shutil
 import time
 from typing import Dict, List, Optional
 
@@ -62,7 +68,24 @@ class Display:
         disp.close()
     """
 
-    def __init__(self, width: int = WINDOW_W, height: int = WINDOW_H):
+    def __init__(
+        self,
+        width: int = WINDOW_W,
+        height: int = WINDOW_H,
+        record_path: Optional[str] = None,
+        record_fps: float = 10.0,
+        record_crf: int = 23,
+    ):
+        """
+        Args:
+            width / height: window size in pixels.
+            record_path: if set, record the dashboard to this MP4 file
+                via ffmpeg.  The video plays back at ``record_fps``.
+            record_fps: frames-per-second for the output video.
+                Set this to ``sim_fps`` so the video runs at real-time.
+            record_crf: H.264 CRF value (0 = lossless, 23 = default,
+                51 = worst).  Lower → better quality / larger file.
+        """
         if pygame is None:
             raise ImportError(
                 "pygame is required for the display. Install with: pip install pygame"
@@ -81,6 +104,42 @@ class Display:
 
         self.should_quit = False
         self._frame_times: List[float] = []
+
+        # ── Video recording ──
+        self._ffmpeg_proc: Optional[subprocess.Popen] = None
+        self._record_path = record_path
+        if record_path is not None:
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if ffmpeg_bin is None:
+                raise RuntimeError(
+                    "ffmpeg not found on PATH. Install ffmpeg to use --record."
+                )
+            # Ensure width/height are even (H.264 requirement)
+            vw = width if width % 2 == 0 else width + 1
+            vh = height if height % 2 == 0 else height + 1
+            cmd = [
+                ffmpeg_bin,
+                "-y",                         # overwrite output
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{vw}x{vh}",
+                "-r", str(record_fps),
+                "-i", "-",                    # read from stdin
+                "-c:v", "libx264",
+                "-crf", str(record_crf),
+                "-pix_fmt", "yuv420p",
+                "-preset", "medium",
+                record_path,
+            ]
+            self._ffmpeg_proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._record_vw = vw
+            self._record_vh = vh
+            print(f"Recording to {record_path}  "
+                  f"(fps={record_fps}, crf={record_crf}, {vw}×{vh})")
 
     # ── public API ────────────────────────────────────────────────
 
@@ -128,10 +187,43 @@ class Display:
         self._draw_reasoning(reasoning)
 
         pygame.display.flip()
+
+        # ── Write frame to ffmpeg if recording ──
+        if self._ffmpeg_proc is not None and self._ffmpeg_proc.stdin:
+            try:
+                # Grab the display surface as a 3-D uint8 array (W, H, 3)
+                raw = pygame.surfarray.array3d(self.screen)  # (W, H, 3)
+                # Transpose to (H, W, 3) = row-major for ffmpeg
+                frame = raw.transpose(1, 0, 2)
+                # Pad to even dimensions if needed
+                if frame.shape[1] != self._record_vw or frame.shape[0] != self._record_vh:
+                    padded = np.zeros(
+                        (self._record_vh, self._record_vw, 3), dtype=np.uint8
+                    )
+                    padded[: frame.shape[0], : frame.shape[1]] = frame
+                    frame = padded
+                self._ffmpeg_proc.stdin.write(frame.tobytes())
+            except (BrokenPipeError, OSError):
+                # ffmpeg process died; stop trying
+                self._ffmpeg_proc = None
+
         self.clock.tick(30)  # cap display refresh at 30 fps
 
     def close(self) -> None:
+        self._stop_recording()
         pygame.quit()
+
+    def _stop_recording(self) -> None:
+        """Finalize the ffmpeg recording."""
+        if self._ffmpeg_proc is not None:
+            try:
+                if self._ffmpeg_proc.stdin:
+                    self._ffmpeg_proc.stdin.close()
+                self._ffmpeg_proc.wait(timeout=10)
+                print(f"Video saved to {self._record_path}")
+            except Exception as e:
+                print(f"Warning: ffmpeg finalize error: {e}")
+            self._ffmpeg_proc = None
 
     # ── internals ─────────────────────────────────────────────────
 
