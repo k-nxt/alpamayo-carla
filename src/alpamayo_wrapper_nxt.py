@@ -17,9 +17,12 @@ from dataclasses import dataclass
 @dataclass
 class AlpamayoOutput:
     """Output from Alpamayo model inference"""
-    trajectory_xy: np.ndarray          # Predicted waypoints (T, 2) in rig frame
-    headings: np.ndarray               # Heading angles (T,) in radians
+    trajectory_xy: np.ndarray          # Selected waypoints (T, 2) in rig frame
+    headings: np.ndarray               # Heading angles (T,) for selected trajectory
     reasoning: Optional[str] = None    # Chain-of-thought reasoning text
+    all_trajectories_xy: Optional[np.ndarray] = None  # All candidates (N, T, 2)
+    all_headings: Optional[np.ndarray] = None          # All headings (N, T)
+    selected_index: int = 0            # Index of the selected trajectory in all_*
 
 
 class AlpamayoWrapper:
@@ -34,7 +37,7 @@ class AlpamayoWrapper:
         self,
         model_name: str = "nvidia/Alpamayo-R1-10B",
         device: str = "cuda",
-        num_traj_samples: int = 1,
+        num_traj_samples: int = 6,
         top_p: float = 0.98,
         temperature: float = 0.6,
     ):
@@ -176,12 +179,19 @@ class AlpamayoWrapper:
                 )
             )
 
-        # Extract trajectory: (batch, num_traj_sets, num_traj_samples, T, 3) → (T, 2)
-        traj = pred_xyz[0, 0, 0].cpu().numpy()  # (T, 3)
-        trajectory_xy = traj[:, :2]               # (T, 2) x,y only
+        # Extract all trajectories: (batch, num_traj_sets, num_traj_samples, T, 3)
+        all_traj = pred_xyz[0, 0].cpu().numpy()   # (N, T, 3)
+        all_traj_xy = all_traj[:, :, :2]           # (N, T, 2)
 
-        # Compute headings from trajectory
-        headings = self._compute_headings(trajectory_xy)
+        # Compute headings for each candidate
+        all_heads = np.array([
+            self._compute_headings(t) for t in all_traj_xy
+        ])  # (N, T)
+
+        # Select a representative trajectory (medoid: closest to the mean)
+        selected_idx = self._select_medoid(all_traj_xy)
+        trajectory_xy = all_traj_xy[selected_idx]
+        headings = all_heads[selected_idx]
 
         # Extract chain-of-thought reasoning
         reasoning = None
@@ -192,6 +202,9 @@ class AlpamayoWrapper:
             trajectory_xy=trajectory_xy,
             headings=headings,
             reasoning=reasoning,
+            all_trajectories_xy=all_traj_xy,
+            all_headings=all_heads,
+            selected_index=selected_idx,
         )
 
     @staticmethod
@@ -206,16 +219,60 @@ class AlpamayoWrapper:
             headings[-1] = headings[-2]
         return headings
 
+    @staticmethod
+    def _select_medoid(all_traj_xy: np.ndarray) -> int:
+        """
+        Select the medoid trajectory — the one closest to the mean of all
+        candidates.  This is more robust than a simple mean because it
+        returns an actual sampled trajectory instead of an average that
+        may not correspond to a physically plausible path.
+
+        Args:
+            all_traj_xy: (N, T, 2) array of candidate trajectories.
+
+        Returns:
+            Index of the medoid trajectory.
+        """
+        n = all_traj_xy.shape[0]
+        if n <= 1:
+            return 0
+
+        # Mean trajectory (N, T, 2) → (T, 2)
+        mean_traj = all_traj_xy.mean(axis=0)
+
+        # Find the candidate with smallest L2 distance to the mean
+        # Compute sum-of-squared-differences per candidate
+        diffs = all_traj_xy - mean_traj[None]          # (N, T, 2)
+        sq_dist = (diffs ** 2).sum(axis=(1, 2))        # (N,)
+        return int(np.argmin(sq_dist))
+
     def predict_dummy(self, **kwargs) -> AlpamayoOutput:
         """Dummy prediction for testing without GPU / model."""
         n_wp = self.pred_num_waypoints or 40
-        # Straight trajectory: ~5 m/s for 4 seconds
-        t = np.linspace(0, 4.0, n_wp)
-        trajectory_xy = np.stack([t * 5.0, np.zeros(n_wp)], axis=1)
-        headings = np.zeros(n_wp)
+        n_samples = self.num_traj_samples
+
+        # Generate N slightly different trajectories
+        rng = np.random.default_rng()
+        all_traj_xy = np.zeros((n_samples, n_wp, 2))
+        for i in range(n_samples):
+            t = np.linspace(0, 4.0, n_wp)
+            speed = 5.0 + rng.normal(0, 0.5)
+            lateral = rng.normal(0, 0.3, size=n_wp).cumsum() * 0.05
+            all_traj_xy[i] = np.stack([t * speed, lateral], axis=1)
+
+        all_heads = np.array([
+            self._compute_headings(t) for t in all_traj_xy
+        ])
+
+        # Select medoid
+        selected_idx = self._select_medoid(all_traj_xy)
+
         return AlpamayoOutput(
-            trajectory_xy=trajectory_xy,
-            headings=headings,
+            trajectory_xy=all_traj_xy[selected_idx],
+            headings=all_heads[selected_idx],
             reasoning="[DUMMY MODE] Driving straight at low speed.",
+            all_trajectories_xy=all_traj_xy,
+            all_headings=all_heads,
+            selected_index=selected_idx,
         )
 

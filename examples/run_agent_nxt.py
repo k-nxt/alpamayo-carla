@@ -38,8 +38,8 @@ def main():
         help="Spawn point index (-1 = random, 0..N = fixed index)",
     )
     parser.add_argument(
-        "--vehicle", default="vehicle.tesla.model3",
-        help="Vehicle blueprint filter",
+        "--vehicle", default="vehicle.mercedes.coupe_2020",
+        help="Vehicle blueprint filter (e.g. vehicle.mercedes.coupe_2020, vehicle.lincoln.mkz_2020)",
     )
     parser.add_argument(
         "--model", default="nvidia/Alpamayo-R1-10B",
@@ -52,6 +52,10 @@ def main():
     parser.add_argument(
         "--max-gen-len", type=int, default=64,
         help="VLM max generation tokens (default 64; 256 for full CoT)",
+    )
+    parser.add_argument(
+        "--num-traj-samples", type=int, default=6,
+        help="Number of trajectory candidates per inference (default 6)",
     )
     parser.add_argument(
         "--diffusion-steps", type=int, default=5,
@@ -96,6 +100,7 @@ def main():
         use_dummy_model=args.dummy,
         model_name=args.model,
         max_speed_kmh=args.max_speed,
+        num_traj_samples=args.num_traj_samples,
         max_generation_length=args.max_gen_len,
         diffusion_steps=args.diffusion_steps,
         cam_resolution=args.cam_res,

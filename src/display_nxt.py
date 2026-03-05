@@ -51,7 +51,17 @@ _TEXT = (210, 210, 210)
 _TEXT_DIM = (120, 120, 130)
 _ACCENT = (80, 180, 255)
 _GREEN = (50, 220, 100)
-_TRAJ_COLOR = (0, 200, 80)
+_TRAJ_COLOR = (0, 200, 80)           # selected trajectory
+_TRAJ_CANDIDATE_COLORS = [           # palette for candidate trajectories
+    (255, 100, 100),  # red
+    (100, 180, 255),  # blue
+    (255, 200, 60),   # yellow
+    (200, 100, 255),  # purple
+    (100, 255, 200),  # cyan
+    (255, 140, 60),   # orange
+    (180, 180, 180),  # grey (fallback)
+    (255, 180, 200),  # pink (fallback)
+]
 _EGO_COLOR = (255, 255, 255)
 
 
@@ -152,6 +162,8 @@ class Display:
         inference_count: int = 0,
         tick_count: int = 0,
         inference_time: float = 0.0,
+        all_trajectories_xy: Optional[np.ndarray] = None,
+        selected_traj_index: int = 0,
     ) -> None:
         """
         Redraw one frame of the dashboard.
@@ -159,11 +171,13 @@ class Display:
         Args:
             camera_images: camera_name → latest HWC uint8 RGB image.
             vehicle_state: dict with ``speed_kmh``, ``speed_ms``, etc.
-            trajectory_xy: (T, 2) predicted waypoints in rig frame (X fwd, Y left).
+            trajectory_xy: (T, 2) selected waypoints in rig frame (X fwd, Y left).
             reasoning: latest chain-of-thought text.
             inference_count: total inference steps so far.
             tick_count: total simulation ticks so far.
             inference_time: wall-clock seconds for the last inference call.
+            all_trajectories_xy: (N, T, 2) all candidate trajectories, or None.
+            selected_traj_index: index of the selected trajectory in all_trajectories_xy.
         """
         self._handle_events()
         if self.should_quit:
@@ -183,7 +197,7 @@ class Display:
         self._draw_hud(vehicle_state, inference_count, tick_count, fps, inference_time)
 
         # ── BEV trajectory + reasoning (bottom-right) ──
-        self._draw_bev(trajectory_xy)
+        self._draw_bev(trajectory_xy, all_trajectories_xy, selected_traj_index)
         self._draw_reasoning(reasoning)
 
         pygame.display.flip()
@@ -332,45 +346,84 @@ class Display:
 
     # -- Bird's-eye trajectory -------------------------------------
 
-    def _draw_bev(self, traj: Optional[np.ndarray]) -> None:
+    def _draw_bev(
+        self,
+        traj: Optional[np.ndarray],
+        all_traj: Optional[np.ndarray] = None,
+        selected_idx: int = 0,
+    ) -> None:
         bev_x = _HUD_W
         bev_y = _BOTTOM_Y
         bev_w = _BEV_W
         bev_h = _BOTTOM_H // 2
         pygame.draw.rect(self.screen, _PANEL_BG, (bev_x, bev_y, bev_w, bev_h))
 
-        title = self.font.render("Trajectory BEV", True, _ACCENT)
+        n_candidates = all_traj.shape[0] if all_traj is not None else (1 if traj is not None else 0)
+        title_text = f"Trajectory BEV  ({n_candidates} samples)"
+        title = self.font.render(title_text, True, _ACCENT)
         self.screen.blit(title, (bev_x + 12, bev_y + 8))
 
         cx = bev_x + bev_w // 2
         cy = bev_y + bev_h - 30  # ego at bottom-center
+        scale = 6.0  # pixels per meter
 
         # Ego marker (triangle pointing up)
         ego_pts = [(cx, cy - 10), (cx - 6, cy + 6), (cx + 6, cy + 6)]
         pygame.draw.polygon(self.screen, _EGO_COLOR, ego_pts)
 
-        if traj is not None and len(traj) >= 2:
-            scale = 6.0  # pixels per meter
-            points = []
-            for wp in traj:
-                # rig frame: X forward (screen up), Y left (screen left)
+        def _traj_to_points(t: np.ndarray):
+            pts = []
+            for wp in t:
                 px = cx - int(wp[1] * scale)
                 py = cy - int(wp[0] * scale)
-                points.append((px, py))
+                pts.append((px, py))
+            return pts
 
-            # Draw trajectory line
-            pygame.draw.lines(self.screen, _TRAJ_COLOR, False, points, 2)
+        # Draw all candidate trajectories (thin, semi-transparent)
+        if all_traj is not None and len(all_traj) > 1:
+            for i, cand in enumerate(all_traj):
+                if i == selected_idx:
+                    continue  # draw selected last (on top)
+                if len(cand) < 2:
+                    continue
+                pts = _traj_to_points(cand)
+                color = _TRAJ_CANDIDATE_COLORS[i % len(_TRAJ_CANDIDATE_COLORS)]
+                # Dim the candidate color
+                dim = tuple(max(0, c // 2) for c in color)
+                pygame.draw.lines(self.screen, dim, False, pts, 1)
+
+        # Draw selected trajectory (thick, bright green)
+        if traj is not None and len(traj) >= 2:
+            points = _traj_to_points(traj)
+            pygame.draw.lines(self.screen, _TRAJ_COLOR, False, points, 3)
 
             # Waypoint dots (every 5th)
             for i, pt in enumerate(points):
                 if i % 5 == 0:
-                    alpha = max(0.3, 1.0 - i / len(points))
-                    c = tuple(int(v * alpha) for v in _TRAJ_COLOR)
+                    alpha_f = max(0.3, 1.0 - i / len(points))
+                    c = tuple(int(v * alpha_f) for v in _TRAJ_COLOR)
                     pygame.draw.circle(self.screen, c, pt, 3)
+
+        # Legend for candidate colors
+        if all_traj is not None and len(all_traj) > 1:
+            lx = bev_x + bev_w - 90
+            ly = bev_y + 32
+            for i in range(min(len(all_traj), len(_TRAJ_CANDIDATE_COLORS))):
+                color = _TRAJ_CANDIDATE_COLORS[i % len(_TRAJ_CANDIDATE_COLORS)]
+                if i == selected_idx:
+                    color = _TRAJ_COLOR
+                    label = f"#{i} ★"
+                else:
+                    color = tuple(max(0, c // 2) for c in color)
+                    label = f"#{i}"
+                pygame.draw.line(self.screen, color, (lx, ly + 6), (lx + 16, ly + 6), 2)
+                lbl_surf = self.font_xs.render(label, True, color)
+                self.screen.blit(lbl_surf, (lx + 20, ly))
+                ly += 16
 
         # Scale bar
         bar_len_m = 10
-        bar_px = int(bar_len_m * 6)
+        bar_px = int(bar_len_m * scale)
         bar_y = bev_y + bev_h - 14
         bar_x = bev_x + 12
         pygame.draw.line(

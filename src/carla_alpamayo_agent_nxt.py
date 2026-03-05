@@ -28,6 +28,12 @@ from .display_nxt import Display
 NUM_HISTORY_STEPS = 16    # ego history length
 HISTORY_TIME_STEP = 0.1   # seconds between history samples
 
+# CARLA rear-axle offset from bounding-box center in vehicle-local frame.
+# CARLA's get_transform() returns the bounding-box center, but Alpamayo's
+# rig origin is at the rear axle.  This offset converts between the two.
+# Value from alpasim's transfuser_impl.py (CARLA_REAR_AXLE).
+_REAR_AXLE_OFFSET_LOCAL = np.array([-1.389, 0.0, 0.0])
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -56,7 +62,7 @@ class AgentConfig:
     model_name: str = "nvidia/Alpamayo-R1-10B"
     use_dummy_model: bool = False
     context_length: int = 4       # temporal image frames
-    num_traj_samples: int = 1
+    num_traj_samples: int = 6
     max_generation_length: int = 64   # VLM max tokens (shorter = faster, CoT truncated)
     diffusion_steps: int = 5          # Flow-matching denoising steps (default 10, 5 for speed)
     cam_resolution: str = "full"      # Camera resolution: "full", "half", "low", or "WxH"
@@ -432,13 +438,18 @@ class CarlaAlpamayoAgent:
     # ==================================================================
 
     def _record_ego_pose(self) -> None:
-        """Snapshot current vehicle pose into the history buffer."""
+        """Snapshot current vehicle pose into the history buffer.
+
+        CARLA's ``get_transform()`` returns the bounding-box center, but
+        Alpamayo expects the rig origin (rear axle).  We apply the fixed
+        offset ``_REAR_AXLE_OFFSET_LOCAL`` to convert.
+        """
         transform = self.vehicle.get_transform()
         snap = self.world.get_snapshot()
         timestamp_us = int(snap.timestamp.elapsed_seconds * 1_000_000)
 
         loc = transform.location
-        location = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
+        center_world = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
 
         rot = transform.rotation
         # CARLA intrinsic ZYX Euler: yaw → pitch → roll (all in degrees)
@@ -447,10 +458,13 @@ class CarlaAlpamayoAgent:
         )
         rotation_matrix = r.as_matrix()
 
+        # Convert bounding-box center → rear axle (rig origin) in world
+        rear_axle_world = center_world + rotation_matrix @ _REAR_AXLE_OFFSET_LOCAL
+
         self.ego_history.append(
             EgoPose(
                 timestamp_us=timestamp_us,
-                location=location,
+                location=rear_axle_world,
                 rotation_matrix=rotation_matrix,
             )
         )
@@ -676,6 +690,8 @@ class CarlaAlpamayoAgent:
                     state = self.get_vehicle_state()
                     traj = output.trajectory_xy if output else None
                     reasoning = output.reasoning if output else None
+                    all_traj = output.all_trajectories_xy if output else None
+                    sel_idx = output.selected_index if output else 0
                     self.display.tick(
                         camera_images=self._get_latest_camera_images(),
                         vehicle_state=state,
@@ -684,6 +700,8 @@ class CarlaAlpamayoAgent:
                         inference_count=self.inference_count,
                         tick_count=self.tick_count,
                         inference_time=self.last_inference_time,
+                        all_trajectories_xy=all_traj,
+                        selected_traj_index=sel_idx,
                     )
                     if self.display.should_quit:
                         print("Display closed – stopping.")
