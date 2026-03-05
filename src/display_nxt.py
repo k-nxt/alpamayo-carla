@@ -51,7 +51,8 @@ _TEXT = (210, 210, 210)
 _TEXT_DIM = (120, 120, 130)
 _ACCENT = (80, 180, 255)
 _GREEN = (50, 220, 100)
-_TRAJ_COLOR = (0, 200, 80)           # selected trajectory
+_TRAJ_COLOR = (0, 200, 80)           # selected / optimised trajectory
+_TRAJ_RAW_COLOR = (200, 200, 60)     # pre-optimisation trajectory (yellow-ish)
 _TRAJ_CANDIDATE_COLORS = [           # palette for candidate trajectories
     (255, 100, 100),  # red
     (100, 180, 255),  # blue
@@ -164,6 +165,7 @@ class Display:
         inference_time: float = 0.0,
         all_trajectories_xy: Optional[np.ndarray] = None,
         selected_traj_index: int = 0,
+        raw_trajectory_xy: Optional[np.ndarray] = None,
     ) -> None:
         """
         Redraw one frame of the dashboard.
@@ -171,13 +173,14 @@ class Display:
         Args:
             camera_images: camera_name → latest HWC uint8 RGB image.
             vehicle_state: dict with ``speed_kmh``, ``speed_ms``, etc.
-            trajectory_xy: (T, 2) selected waypoints in rig frame (X fwd, Y left).
+            trajectory_xy: (T, 2) active waypoints (may be optimised).
             reasoning: latest chain-of-thought text.
             inference_count: total inference steps so far.
             tick_count: total simulation ticks so far.
             inference_time: wall-clock seconds for the last inference call.
             all_trajectories_xy: (N, T, 2) all candidate trajectories, or None.
-            selected_traj_index: index of the selected trajectory in all_trajectories_xy.
+            selected_traj_index: index of the selected trajectory.
+            raw_trajectory_xy: (T, 2) pre-optimisation model output (or None).
         """
         self._handle_events()
         if self.should_quit:
@@ -197,7 +200,10 @@ class Display:
         self._draw_hud(vehicle_state, inference_count, tick_count, fps, inference_time)
 
         # ── BEV trajectory + reasoning (bottom-right) ──
-        self._draw_bev(trajectory_xy, all_trajectories_xy, selected_traj_index)
+        self._draw_bev(
+            trajectory_xy, all_trajectories_xy, selected_traj_index,
+            raw_traj=raw_trajectory_xy,
+        )
         self._draw_reasoning(reasoning)
 
         pygame.display.flip()
@@ -351,6 +357,7 @@ class Display:
         traj: Optional[np.ndarray],
         all_traj: Optional[np.ndarray] = None,
         selected_idx: int = 0,
+        raw_traj: Optional[np.ndarray] = None,
     ) -> None:
         bev_x = _HUD_W
         bev_y = _BOTTOM_Y
@@ -392,7 +399,12 @@ class Display:
                 dim = tuple(max(0, c // 2) for c in color)
                 pygame.draw.lines(self.screen, dim, False, pts, 1)
 
-        # Draw selected trajectory (thick, bright green)
+        # Draw raw (pre-optimisation) trajectory if available
+        if raw_traj is not None and len(raw_traj) >= 2:
+            raw_pts = _traj_to_points(raw_traj)
+            pygame.draw.lines(self.screen, _TRAJ_RAW_COLOR, False, raw_pts, 2)
+
+        # Draw selected / optimised trajectory (thick, bright green)
         if traj is not None and len(traj) >= 2:
             points = _traj_to_points(traj)
             pygame.draw.lines(self.screen, _TRAJ_COLOR, False, points, 3)
@@ -420,6 +432,18 @@ class Display:
                 lbl_surf = self.font_xs.render(label, True, color)
                 self.screen.blit(lbl_surf, (lx + 20, ly))
                 ly += 16
+
+        # Legend entry for raw vs optimised
+        if raw_traj is not None:
+            lx = bev_x + 12
+            ly = bev_y + 32
+            pygame.draw.line(self.screen, _TRAJ_RAW_COLOR, (lx, ly + 6), (lx + 16, ly + 6), 2)
+            lbl = self.font_xs.render("raw", True, _TRAJ_RAW_COLOR)
+            self.screen.blit(lbl, (lx + 20, ly))
+            ly += 16
+            pygame.draw.line(self.screen, _TRAJ_COLOR, (lx, ly + 6), (lx + 16, ly + 6), 3)
+            lbl = self.font_xs.render("opt", True, _TRAJ_COLOR)
+            self.screen.blit(lbl, (lx + 20, ly))
 
         # Scale bar
         bar_len_m = 10

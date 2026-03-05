@@ -85,6 +85,36 @@ def main():
         "--crf", type=int, default=23,
         help="H.264 CRF for recording (0=lossless, 23=default, 51=worst)",
     )
+
+    # ── Trajectory optimizer ──
+    parser.add_argument(
+        "--traj-opt", action="store_true",
+        help="Enable trajectory optimiser (smoothness + comfort post-processing)",
+    )
+    parser.add_argument(
+        "--traj-opt-smooth", type=float, default=1.0,
+        help="Optimiser smoothness weight (default 1.0)",
+    )
+    parser.add_argument(
+        "--traj-opt-deviation", type=float, default=0.1,
+        help="Optimiser deviation weight (default 0.1)",
+    )
+    parser.add_argument(
+        "--traj-opt-comfort", type=float, default=2.0,
+        help="Optimiser comfort penalty weight (default 2.0)",
+    )
+    parser.add_argument(
+        "--traj-opt-iter", type=int, default=50,
+        help="Optimiser max iterations (default 50)",
+    )
+    parser.add_argument(
+        "--no-retime", action="store_true",
+        help="Disable Frenet retiming in trajectory optimiser",
+    )
+    parser.add_argument(
+        "--retime-alpha", type=float, default=0.25,
+        help="Retiming strength [0..1] (default 0.25)",
+    )
     args = parser.parse_args()
 
     # Recording requires the display to be enabled
@@ -109,6 +139,13 @@ def main():
         enable_display=not args.no_display,
         record_path=args.record,
         record_crf=args.crf,
+        traj_opt_enabled=args.traj_opt,
+        traj_opt_smoothness_w=args.traj_opt_smooth,
+        traj_opt_deviation_w=args.traj_opt_deviation,
+        traj_opt_comfort_w=args.traj_opt_comfort,
+        traj_opt_max_iter=args.traj_opt_iter,
+        traj_opt_retime=not args.no_retime,
+        traj_opt_retime_alpha=args.retime_alpha,
     )
 
     with CarlaAlpamayoAgent(config) as agent:

@@ -21,6 +21,12 @@ from scipy.spatial.transform import Rotation
 from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
 from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
 from .display_nxt import Display
+from .trajectory_optimizer_nxt import (
+    TrajectoryOptimizer,
+    VehicleConstraints,
+    add_heading_to_trajectory,
+    OptimizationResult,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (must match Alpamayo-R1 expectations)
@@ -81,6 +87,15 @@ class AgentConfig:
     # Video recording
     record_path: Optional[str] = None  # MP4 output path (None = no recording)
     record_crf: int = 23              # H.264 CRF (0=lossless, 23=default, 51=worst)
+
+    # Trajectory optimiser (post-processing for smoothness / comfort)
+    traj_opt_enabled: bool = False          # enable trajectory optimisation
+    traj_opt_smoothness_w: float = 1.0      # smoothness cost weight
+    traj_opt_deviation_w: float = 0.1       # deviation from model output weight
+    traj_opt_comfort_w: float = 2.0         # comfort penalty weight
+    traj_opt_max_iter: int = 50             # max scipy iterations
+    traj_opt_retime: bool = True            # Frenet retiming
+    traj_opt_retime_alpha: float = 0.25     # retiming strength [0..1]
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +317,7 @@ class CarlaAlpamayoAgent:
         self.alpamayo: Optional[AlpamayoWrapper] = None
         self.follower: Optional[TrajectoryFollower] = None
         self.display: Optional[Display] = None
+        self.traj_optimizer: Optional[TrajectoryOptimizer] = None
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -312,6 +328,7 @@ class CarlaAlpamayoAgent:
         self.tick_count = 0
         self.last_output: Optional[AlpamayoOutput] = None
         self.last_inference_time: float = 0.0  # seconds (wall clock)
+        self.last_opt_result: Optional[OptimizationResult] = None
 
     # ==================================================================
     # Initialisation helpers
@@ -416,6 +433,24 @@ class CarlaAlpamayoAgent:
             lookahead_distance=self.config.lookahead_distance,
             max_speed_kmh=self.config.max_speed_kmh,
         )
+
+        # Trajectory optimiser (optional post-processing)
+        if self.config.traj_opt_enabled:
+            self.traj_optimizer = TrajectoryOptimizer(
+                smoothness_weight=self.config.traj_opt_smoothness_w,
+                deviation_weight=self.config.traj_opt_deviation_w,
+                comfort_weight=self.config.traj_opt_comfort_w,
+                max_iterations=self.config.traj_opt_max_iter,
+                enable_frenet_retiming=self.config.traj_opt_retime,
+                retime_alpha=self.config.traj_opt_retime_alpha,
+            )
+            print("Trajectory optimiser enabled "
+                  f"(smooth={self.config.traj_opt_smoothness_w}, "
+                  f"dev={self.config.traj_opt_deviation_w}, "
+                  f"comfort={self.config.traj_opt_comfort_w}, "
+                  f"retime={self.config.traj_opt_retime})")
+        else:
+            self.traj_optimizer = None
 
         # Synchronous mode for deterministic ticking
         settings = self.world.get_settings()
@@ -613,9 +648,31 @@ class CarlaAlpamayoAgent:
                 self.last_inference_time = time.perf_counter() - t0
 
                 self.last_output = output
-                self.follower.set_trajectory(
-                    output.trajectory_xy, output.headings
-                )
+
+                # ── Trajectory optimisation (optional) ──
+                traj_xy = output.trajectory_xy
+                headings = output.headings
+
+                if (
+                    self.traj_optimizer is not None
+                    and traj_xy is not None
+                    and len(traj_xy) >= 2
+                ):
+                    traj_xyh = add_heading_to_trajectory(traj_xy)
+                    opt_result = self.traj_optimizer.optimize(
+                        trajectory=traj_xyh,
+                        time_step=1.0 / 10.0,  # AR1 output at 10 Hz
+                        retime_in_frenet=self.config.traj_opt_retime,
+                        retime_alpha=self.config.traj_opt_retime_alpha,
+                    )
+                    self.last_opt_result = opt_result
+                    if opt_result.success:
+                        traj_xy = opt_result.trajectory[:, :2]
+                        headings = opt_result.trajectory[:, 2]
+                else:
+                    self.last_opt_result = None
+
+                self.follower.set_trajectory(traj_xy, headings)
                 self.inference_count += 1
 
         # --- control ---
@@ -688,20 +745,24 @@ class CarlaAlpamayoAgent:
                 # ── pygame display ──
                 if self.display is not None:
                     state = self.get_vehicle_state()
-                    traj = output.trajectory_xy if output else None
+                    # The follower holds the (possibly optimised) trajectory
+                    active_traj = self.follower.trajectory
+                    # Raw model output for comparison
+                    raw_traj = output.trajectory_xy if output else None
                     reasoning = output.reasoning if output else None
                     all_traj = output.all_trajectories_xy if output else None
                     sel_idx = output.selected_index if output else 0
                     self.display.tick(
                         camera_images=self._get_latest_camera_images(),
                         vehicle_state=state,
-                        trajectory_xy=traj,
+                        trajectory_xy=active_traj,
                         reasoning=reasoning,
                         inference_count=self.inference_count,
                         tick_count=self.tick_count,
                         inference_time=self.last_inference_time,
                         all_trajectories_xy=all_traj,
                         selected_traj_index=sel_idx,
+                        raw_trajectory_xy=raw_traj if self.traj_optimizer else None,
                     )
                     if self.display.should_quit:
                         print("Display closed – stopping.")
@@ -721,12 +782,16 @@ class CarlaAlpamayoAgent:
                     cot = ""
                     if output and output.reasoning:
                         cot = output.reasoning[:60].replace("\n", " ") + "…"
+                    opt_tag = ""
+                    if self.last_opt_result is not None:
+                        r = self.last_opt_result
+                        opt_tag = f" Opt:{'OK' if r.success else 'FAIL'}"
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
                         f"({self.last_inference_time:.2f}s) | "
                         f"Spd {st['speed_kmh']:5.1f} | "
                         f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} | "
-                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m | {cot}"
+                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{opt_tag} | {cot}"
                     )
                 tick += 1
 
