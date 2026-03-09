@@ -64,6 +64,7 @@ _TRAJ_CANDIDATE_COLORS = [           # palette for candidate trajectories
     (255, 180, 200),  # pink (fallback)
 ]
 _EGO_COLOR = (255, 255, 255)
+_ACTUAL_PATH_COLOR = (100, 160, 255)   # blue — actual vehicle path (observer)
 
 
 class Display:
@@ -166,6 +167,11 @@ class Display:
         all_trajectories_xy: Optional[np.ndarray] = None,
         selected_traj_index: int = 0,
         raw_trajectory_xy: Optional[np.ndarray] = None,
+        # ── Observer-mode extras (ignored when not in observer mode) ──
+        observer_mode: bool = False,
+        delay_ticks: int = -1,
+        actual_path_rig: Optional[np.ndarray] = None,
+        autopilot_state: Optional[Dict] = None,
     ) -> None:
         """
         Redraw one frame of the dashboard.
@@ -181,6 +187,12 @@ class Display:
             all_trajectories_xy: (N, T, 2) all candidate trajectories, or None.
             selected_traj_index: index of the selected trajectory.
             raw_trajectory_xy: (T, 2) pre-optimisation model output (or None).
+            observer_mode: if True, show observer-specific overlay.
+            delay_ticks: ticks elapsed since the inference input was captured
+                (-1 = no result yet).
+            actual_path_rig: (N, 2) recent actual vehicle path in rig frame.
+            autopilot_state: dict with ``throttle``, ``brake``, ``steer`` from
+                the autopilot (for HUD display in observer mode).
         """
         self._handle_events()
         if self.should_quit:
@@ -197,12 +209,19 @@ class Display:
         self._draw_cameras(camera_images)
 
         # ── HUD (bottom-left) ──
-        self._draw_hud(vehicle_state, inference_count, tick_count, fps, inference_time)
+        self._draw_hud(
+            vehicle_state, inference_count, tick_count, fps, inference_time,
+            observer_mode=observer_mode,
+            delay_ticks=delay_ticks,
+            autopilot_state=autopilot_state,
+        )
 
         # ── BEV trajectory + reasoning (bottom-right) ──
         self._draw_bev(
             trajectory_xy, all_trajectories_xy, selected_traj_index,
             raw_traj=raw_trajectory_xy,
+            actual_path_rig=actual_path_rig,
+            observer_mode=observer_mode,
         )
         self._draw_reasoning(reasoning)
 
@@ -303,6 +322,9 @@ class Display:
         tick: int,
         fps: int,
         inference_time: float = 0.0,
+        observer_mode: bool = False,
+        delay_ticks: int = -1,
+        autopilot_state: Optional[Dict] = None,
     ) -> None:
         x, y = 0, _BOTTOM_Y
         w, h = _HUD_W, _BOTTOM_H
@@ -335,8 +357,39 @@ class Display:
             rot = state.get("rotation", {})
             lines.append((f"Yaw      {rot.get('yaw', 0):6.1f}°", _TEXT_DIM))
 
+        # ── Observer-mode extras ──
+        if observer_mode:
+            lines.append(("", _TEXT_DIM))  # spacer
+            lines.append(("── OBSERVER MODE ──", (255, 180, 60)))
+
+            # Delay info
+            if delay_ticks >= 0:
+                delay_s = delay_ticks * 0.1  # assuming 10 Hz
+                delay_color = (
+                    _GREEN if delay_ticks <= 20
+                    else ((255, 200, 50) if delay_ticks <= 50 else (255, 80, 80))
+                )
+                lines.append((
+                    f"Delay    {delay_ticks:4d} tick ({delay_s:.1f}s)",
+                    delay_color,
+                ))
+            else:
+                lines.append(("Delay       - (waiting)", _TEXT_DIM))
+
+            # Autopilot control state
+            ap = autopilot_state or state
+            if ap:
+                thr = ap.get("throttle", 0.0)
+                brk = ap.get("brake", 0.0)
+                steer = ap.get("steer", 0.0)
+                lines.append((
+                    f"AP  Thr {thr:.2f}  Brk {brk:.2f}  Str {steer:+.2f}",
+                    _ACTUAL_PATH_COLOR,
+                ))
+
         # Section title
-        title = self.font.render("Vehicle HUD", True, _ACCENT)
+        title_text = "Observer HUD" if observer_mode else "Vehicle HUD"
+        title = self.font.render(title_text, True, _ACCENT)
         self.screen.blit(title, (x + 12, y + 8))
 
         ty = y + 40
@@ -358,6 +411,8 @@ class Display:
         all_traj: Optional[np.ndarray] = None,
         selected_idx: int = 0,
         raw_traj: Optional[np.ndarray] = None,
+        actual_path_rig: Optional[np.ndarray] = None,
+        observer_mode: bool = False,
     ) -> None:
         bev_x = _HUD_W
         bev_y = _BOTTOM_Y
@@ -366,7 +421,10 @@ class Display:
         pygame.draw.rect(self.screen, _PANEL_BG, (bev_x, bev_y, bev_w, bev_h))
 
         n_candidates = all_traj.shape[0] if all_traj is not None else (1 if traj is not None else 0)
-        title_text = f"Trajectory BEV  ({n_candidates} samples)"
+        if observer_mode:
+            title_text = f"BEV  (Observer: {n_candidates} samples)"
+        else:
+            title_text = f"Trajectory BEV  ({n_candidates} samples)"
         title = self.font.render(title_text, True, _ACCENT)
         self.screen.blit(title, (bev_x + 12, bev_y + 8))
 
@@ -444,6 +502,31 @@ class Display:
             pygame.draw.line(self.screen, _TRAJ_COLOR, (lx, ly + 6), (lx + 16, ly + 6), 3)
             lbl = self.font_xs.render("opt", True, _TRAJ_COLOR)
             self.screen.blit(lbl, (lx + 20, ly))
+
+        # Draw actual vehicle path (observer mode)
+        if actual_path_rig is not None and len(actual_path_rig) >= 2:
+            actual_pts = _traj_to_points(actual_path_rig)
+            pygame.draw.lines(self.screen, _ACTUAL_PATH_COLOR, False, actual_pts, 2)
+
+        # Legend for observer mode
+        if observer_mode:
+            lx = bev_x + 12
+            ly = bev_y + 32
+            if actual_path_rig is not None:
+                pygame.draw.line(
+                    self.screen, _ACTUAL_PATH_COLOR,
+                    (lx, ly + 6), (lx + 16, ly + 6), 2,
+                )
+                lbl = self.font_xs.render("actual", True, _ACTUAL_PATH_COLOR)
+                self.screen.blit(lbl, (lx + 20, ly))
+                ly += 16
+            if traj is not None:
+                pygame.draw.line(
+                    self.screen, _TRAJ_COLOR,
+                    (lx, ly + 6), (lx + 16, ly + 6), 3,
+                )
+                lbl = self.font_xs.render("alpamayo", True, _TRAJ_COLOR)
+                self.screen.blit(lbl, (lx + 20, ly))
 
         # Scale bar
         bar_len_m = 10

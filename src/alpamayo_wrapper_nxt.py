@@ -19,10 +19,11 @@ class AlpamayoOutput:
     """Output from Alpamayo model inference"""
     trajectory_xy: np.ndarray          # Selected waypoints (T, 2) in rig frame
     headings: np.ndarray               # Heading angles (T,) for selected trajectory
-    reasoning: Optional[str] = None    # Chain-of-thought reasoning text
+    reasoning: Optional[str] = None    # Chain-of-thought reasoning text (for SELECTED trajectory)
     all_trajectories_xy: Optional[np.ndarray] = None  # All candidates (N, T, 2)
     all_headings: Optional[np.ndarray] = None          # All headings (N, T)
     selected_index: int = 0            # Index of the selected trajectory in all_*
+    all_reasoning: Optional[List[str]] = None  # CoT per candidate (N,)
 
 
 class AlpamayoWrapper:
@@ -193,10 +194,16 @@ class AlpamayoWrapper:
         trajectory_xy = all_traj_xy[selected_idx]
         headings = all_heads[selected_idx]
 
-        # Extract chain-of-thought reasoning
-        reasoning = None
+        # Extract chain-of-thought reasoning for ALL candidates.
+        # extra["cot"] shape: (B, num_traj_sets, num_traj_samples)
+        # Each element is a string.  We must pick the CoT that
+        # corresponds to the *selected* trajectory, not always #0.
+        all_reasoning: Optional[List[str]] = None
+        reasoning: Optional[str] = None
         if "cot" in extra and extra["cot"].size > 0:
-            reasoning = str(extra["cot"].flat[0])
+            cot_arr = extra["cot"][0, 0]  # (num_traj_samples,)
+            all_reasoning = [str(c) for c in cot_arr]
+            reasoning = all_reasoning[selected_idx]
 
         return AlpamayoOutput(
             trajectory_xy=trajectory_xy,
@@ -205,6 +212,7 @@ class AlpamayoWrapper:
             all_trajectories_xy=all_traj_xy,
             all_headings=all_heads,
             selected_index=selected_idx,
+            all_reasoning=all_reasoning,
         )
 
     @staticmethod
@@ -219,32 +227,56 @@ class AlpamayoWrapper:
             headings[-1] = headings[-2]
         return headings
 
+    # Trajectory length threshold (meters) to classify "go" vs "stop".
+    _GO_THRESHOLD = 3.0
+
     @staticmethod
-    def _select_medoid(all_traj_xy: np.ndarray) -> int:
+    def _traj_length(traj_xy: np.ndarray) -> float:
+        """Arc-length of a (T, 2) trajectory."""
+        if len(traj_xy) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(traj_xy, axis=0), axis=1)))
+
+    @classmethod
+    def _select_medoid(cls, all_traj_xy: np.ndarray) -> int:
         """
-        Select the medoid trajectory — the one closest to the mean of all
-        candidates.  This is more robust than a simple mean because it
-        returns an actual sampled trajectory instead of an average that
-        may not correspond to a physically plausible path.
+        Majority-vote trajectory selection.
+
+        1. Compute arc-length for each candidate.
+        2. Classify each as "go" (length ≥ threshold) or "stop".
+        3. Pick the majority group; compute medoid within that group.
+
+        This prevents a few short "stop" outliers from dragging the
+        mean down and biasing the medoid toward stopping when the
+        majority of samples want to proceed.
 
         Args:
             all_traj_xy: (N, T, 2) array of candidate trajectories.
 
         Returns:
-            Index of the medoid trajectory.
+            Index into *all_traj_xy* of the selected trajectory.
         """
         n = all_traj_xy.shape[0]
         if n <= 1:
             return 0
 
-        # Mean trajectory (N, T, 2) → (T, 2)
-        mean_traj = all_traj_xy.mean(axis=0)
+        lengths = np.array([cls._traj_length(t) for t in all_traj_xy])
+        go_mask = lengths >= cls._GO_THRESHOLD
+        n_go = int(go_mask.sum())
 
-        # Find the candidate with smallest L2 distance to the mean
-        # Compute sum-of-squared-differences per candidate
-        diffs = all_traj_xy - mean_traj[None]          # (N, T, 2)
-        sq_dist = (diffs ** 2).sum(axis=(1, 2))        # (N,)
-        return int(np.argmin(sq_dist))
+        if n_go > 0 and n_go >= n - n_go:
+            # Majority (or tie) says "go" → medoid among GO trajectories
+            subset_indices = np.where(go_mask)[0]
+        else:
+            # Majority says "stop" → medoid among STOP trajectories
+            subset_indices = np.where(~go_mask)[0]
+
+        subset = all_traj_xy[subset_indices]
+        mean_traj = subset.mean(axis=0)
+        diffs = subset - mean_traj[None]
+        sq_dist = (diffs ** 2).sum(axis=(1, 2))
+        best_local = int(np.argmin(sq_dist))
+        return int(subset_indices[best_local])
 
     def predict_dummy(self, **kwargs) -> AlpamayoOutput:
         """Dummy prediction for testing without GPU / model."""

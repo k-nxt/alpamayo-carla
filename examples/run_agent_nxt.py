@@ -26,6 +26,16 @@ def main():
     parser.add_argument("--host", default="localhost", help="CARLA server host")
     parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
     parser.add_argument(
+        "--map", type=str, default=None, metavar="NAME",
+        help="CARLA map to load (e.g. Town01..Town15, Town10HD). "
+             "Omit to keep the current map.",
+    )
+    parser.add_argument(
+        "--weather", type=str, default="ClearNoon",
+        help="Weather preset: ClearNoon (default), CloudyNoon, WetNoon, "
+             "SoftRainNoon, MidRainyNoon, HardRainNoon, ClearSunset, etc.",
+    )
+    parser.add_argument(
         "--frames", type=int, default=500,
         help="Max inference frames to run",
     )
@@ -50,6 +60,18 @@ def main():
         help="Max speed in km/h",
     )
     parser.add_argument(
+        "--min-speed", type=float, default=0.0,
+        help="Min cruise speed in km/h (0=no minimum). "
+             "Applies as a floor on desired speed except when the model "
+             "explicitly commands a stop.  Useful for maps with domain gap "
+             "where the model produces consistently short trajectories.",
+    )
+    parser.add_argument(
+        "--steer-gain", type=float, default=1.0,
+        help="Steering gain multiplier (default 1.0; >1 = sharper turns). "
+             "Useful when the car cannot make curves at higher min-speed.",
+    )
+    parser.add_argument(
         "--max-gen-len", type=int, default=64,
         help="VLM max generation tokens (default 64; 256 for full CoT)",
     )
@@ -64,6 +86,14 @@ def main():
     parser.add_argument(
         "--cam-res", type=str, default="full",
         help="Camera resolution: 'full' (1900x1080), 'half' (960x540), 'low' (640x360), or 'WxH'",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.6,
+        help="VLM text-generation temperature (default 0.6; lower → more deterministic CoT & trajectory)",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=0.98,
+        help="VLM nucleus-sampling threshold (default 0.98)",
     )
     parser.add_argument(
         "--inference-interval", type=int, default=1,
@@ -125,15 +155,21 @@ def main():
     config = AgentConfig(
         host=args.host,
         port=args.port,
+        map_name=args.map,
+        weather=args.weather,
         spawn_point_index=args.spawn,
         vehicle_filter=args.vehicle,
         use_dummy_model=args.dummy,
         model_name=args.model,
         max_speed_kmh=args.max_speed,
+        min_speed_kmh=args.min_speed,
+        steer_gain=args.steer_gain,
         num_traj_samples=args.num_traj_samples,
         max_generation_length=args.max_gen_len,
         diffusion_steps=args.diffusion_steps,
         cam_resolution=args.cam_res,
+        vlm_temperature=args.temperature,
+        vlm_top_p=args.top_p,
         sim_fps=args.sim_fps,
         inference_interval=args.inference_interval,
         enable_display=not args.no_display,

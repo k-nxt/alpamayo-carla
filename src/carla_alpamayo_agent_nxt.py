@@ -59,6 +59,8 @@ class AgentConfig:
     host: str = "localhost"
     port: int = 2000
     timeout: float = 10.0
+    map_name: Optional[str] = None  # e.g. "Town03" — None = keep current map
+    weather: str = "ClearNoon"      # weather preset name (see WEATHER_PRESETS)
 
     # Vehicle
     vehicle_filter: str = "vehicle.tesla.model3"
@@ -72,6 +74,8 @@ class AgentConfig:
     max_generation_length: int = 64   # VLM max tokens (shorter = faster, CoT truncated)
     diffusion_steps: int = 5          # Flow-matching denoising steps (default 10, 5 for speed)
     cam_resolution: str = "full"      # Camera resolution: "full", "half", "low", or "WxH"
+    vlm_temperature: float = 0.6      # VLM text-generation temperature (lower = more deterministic)
+    vlm_top_p: float = 0.98           # VLM nucleus-sampling threshold
 
     # Simulation
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
@@ -79,7 +83,9 @@ class AgentConfig:
 
     # Control
     max_speed_kmh: float = 30.0
+    min_speed_kmh: float = 0.0        # 0 = no minimum; >0 = floor for desired speed
     lookahead_distance: float = 5.0   # pure-pursuit look-ahead (m)
+    steer_gain: float = 1.0           # steering multiplier (>1 = sharper turns)
 
     # Display
     enable_display: bool = True       # pygame dashboard window
@@ -116,18 +122,42 @@ class TrajectoryFollower:
     (EMA) before being used for throttle/brake decisions.
     """
 
-    # EMA smoothing factor: lower → more smoothing, slower response.
-    SPEED_EMA_ALPHA = 0.3
+    # EMA smoothing factor for *acceleration* (speed increasing).
+    # Low value absorbs the stochastic oscillation from the diffusion
+    # model (which frequently alternates between "go" and "stop"
+    # trajectories even on clear straight roads).
+    SPEED_EMA_ALPHA_ACCEL = 0.15
+
+    # EMA smoothing factor for *deceleration* (speed decreasing).
+    # Higher value allows the car to respond quickly to curves,
+    # obstacles, and stop commands without the sluggish response
+    # of the acceleration EMA.
+    SPEED_EMA_ALPHA_DECEL = 0.5
+
+    # EMA smoothing for steering to prevent sudden direction changes.
+    # 0.7 favours the *new* value — responsive enough for curves
+    # while still filtering stochastic noise from the diffusion model.
+    STEER_EMA_ALPHA = 0.7
+
+    # After this many consecutive ticks at standstill with no meaningful
+    # trajectory, apply a gentle "nudge" throttle to give the model
+    # motion cues in its temporal frames.
+    STANDSTILL_NUDGE_TICKS = 15
+    STANDSTILL_NUDGE_THROTTLE = 0.3
 
     def __init__(
         self,
         lookahead_distance: float = 5.0,
         max_speed_kmh: float = 30.0,
-        wheelbase: float = 2.875,          # Tesla Model 3 approx
+        min_speed_kmh: float = 0.0,
+        steer_gain: float = 1.0,
+        wheelbase: float = 2.875,          # Mercedes coupe approx
         output_frequency_hz: float = 10.0,  # Alpamayo outputs at 10 Hz
     ):
         self.lookahead_distance = lookahead_distance
         self.max_speed_ms = max_speed_kmh / 3.6
+        self.min_speed_ms = min_speed_kmh / 3.6
+        self.steer_gain = steer_gain
         self.wheelbase = wheelbase
         self.dt = 1.0 / output_frequency_hz
 
@@ -135,7 +165,13 @@ class TrajectoryFollower:
         self.headings: Optional[np.ndarray] = None
         self._raw_desired_speed: float = 0.0   # instant (before EMA)
         self._last_desired_speed: float = 0.0  # smoothed (after EMA), for display
+        self._last_steer: float = 0.0          # EMA-smoothed steering
+        self._raw_steer: float = 0.0           # instant steering (for display)
+        self._hdg_weight: float = 0.0          # heading blend weight (for logging)
         self._last_control: Optional[carla.VehicleControl] = None  # for logging
+        self._standstill_ticks: int = 0        # consecutive ticks at ~0 speed
+        self._curve_safe_speed: float = 999.0  # curvature-based speed limit (for logging)
+        self._smoothed_curve_safe: float = 999.0  # EMA-smoothed curve-safe speed
 
     def set_trajectory(
         self,
@@ -161,8 +197,24 @@ class TrajectoryFollower:
 
         traj_length = self._trajectory_length()
 
-        # ── Steering (pure pursuit) ──
-        lookahead = self._find_lookahead_point()
+        # ── Steering: Pure Pursuit + Heading blend ──
+        #
+        # Pure Pursuit provides smooth path-following but tends to
+        # *under-steer* on tight curves because the lookahead point
+        # smooths out the curvature.
+        #
+        # The trajectory headings give us a direct measure of the
+        # desired yaw change.  By blending the two we get the best
+        # of both: stable tracking on straights with sharper response
+        # in curves.
+        #
+        # Blend ratio: heading contribution increases with curvature.
+
+        # Speed-adaptive lookahead
+        la_base = self.lookahead_distance
+        la_adaptive = np.clip(la_base * (current_speed_ms / 5.0), 2.0, la_base * 2.0)
+
+        lookahead = self._find_lookahead_point(override_distance=la_adaptive)
         if lookahead is None:
             ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.5)
             self._last_control = ctrl
@@ -171,62 +223,188 @@ class TrajectoryFollower:
         dx, dy = float(lookahead[0]), float(lookahead[1])
         dist = np.hypot(dx, dy)
 
+        # --- Component 1: Pure Pursuit ---
         if dist < 0.1:
-            steer = 0.0
+            pp_steer = 0.0
         else:
             curvature = 2.0 * dy / (dist ** 2)
             steer_rad = np.arctan(curvature * self.wheelbase)
-            steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
+            pp_steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
             # Rig Y-left positive → CARLA steer-right positive ⇒ flip
-            steer = -steer
+            pp_steer = -pp_steer
+
+        # --- Component 2: Heading-based steering ---
+        # Use the heading at a point ~1-2s ahead to determine the
+        # desired yaw change, then convert to a steering command.
+        hdg_steer = self._heading_based_steer(current_speed_ms)
+
+        # --- Adaptive blend ---
+        # On straights (both components ≈ 0) Pure Pursuit dominates.
+        # When heading component is large (curve), it gets more weight.
+        # Blend weight = clamp(|hdg_steer| * 5, 0, 0.7)
+        # The high cap (0.7) allows heading-based steering to dominate
+        # during tight turns where Pure Pursuit under-steers due to
+        # the lookahead smoothing out the curvature.
+        hdg_weight = float(np.clip(abs(hdg_steer) * 5.0, 0.0, 0.7))
+        self._hdg_weight = hdg_weight
+        raw_steer = (1.0 - hdg_weight) * pp_steer + hdg_weight * hdg_steer
+
+        # Apply user-configurable steering gain (>1 for sharper turns)
+        raw_steer = float(np.clip(raw_steer * self.steer_gain, -1.0, 1.0))
+
+        # EMA-smooth steering to prevent abrupt direction changes
+        # from stochastic trajectory predictions.
+        # When the heading blend is active (curve detected), use a
+        # faster EMA so the steering responds quickly enough to
+        # track the curve.  On straights, keep the slower EMA to
+        # filter out noise.
+        self._raw_steer = raw_steer
+        steer_alpha = self.STEER_EMA_ALPHA  # 0.7 base
+        if hdg_weight > 0.2:
+            # In a curve — allow faster steering response (up to 0.9)
+            steer_alpha = min(0.9, self.STEER_EMA_ALPHA + hdg_weight * 0.4)
+        steer = steer_alpha * raw_steer + (1.0 - steer_alpha) * self._last_steer
+        self._last_steer = steer
 
         # ── Speed target ──
         raw_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
 
         # If trajectory is extremely short, the model wants us to stop.
-        if traj_length < 0.5:
+        explicit_stop = traj_length < 0.5
+        if explicit_stop:
             raw_speed = 0.0
 
         self._raw_desired_speed = raw_speed
 
-        # Smooth with EMA to dampen stochastic oscillation
-        alpha = self.SPEED_EMA_ALPHA
+        # Asymmetric EMA: fast decel (react to curves / stops quickly),
+        # slow accel (absorb stochastic go/stop oscillation).
+        if raw_speed < self._last_desired_speed:
+            alpha = self.SPEED_EMA_ALPHA_DECEL   # 0.5 — responsive
+        else:
+            alpha = self.SPEED_EMA_ALPHA_ACCEL   # 0.15 — conservative
         desired_speed = alpha * raw_speed + (1.0 - alpha) * self._last_desired_speed
+
+        # ── Curvature-based speed limit ──
+        # If the trajectory curves sharply, the car must slow down.
+        # We estimate the maximum curvature and compute a safe speed:
+        #   v_safe = sqrt(a_lat_max / κ)
+        max_curv = self._estimate_max_curvature()
+        _A_LAT_MAX = 2.5   # comfortable lateral acceleration (m/s²)
+        # NOTE: theoretical tyre grip ~5-6 m/s², but CARLA's physics
+        # simulation includes tyre slip which increases the effective
+        # turning radius.  2.5 accounts for this, providing a safety
+        # margin that prevents the car from going wide on sharp bends.
+        if max_curv > 0.005:
+            curve_safe_raw = float(np.sqrt(_A_LAT_MAX / max_curv))
+        else:
+            curve_safe_raw = 999.0
+
+        # Smooth curve_safe with asymmetric EMA:
+        #  - Fast decrease (α=0.7): react quickly to a tighter curve.
+        #  - Very slow increase (α=0.02): maintain caution for many ticks
+        #    after a curve is detected.  A single "straight" trajectory
+        #    from the stochastic model must NOT cause the car to
+        #    re-accelerate before the curve is actually cleared.
+        #    With α=0.02, recovery from curv=6.6 takes ~50 ticks.
+        if curve_safe_raw < self._smoothed_curve_safe:
+            cs_alpha = 0.7
+        else:
+            cs_alpha = 0.02
+        self._smoothed_curve_safe = (
+            cs_alpha * curve_safe_raw
+            + (1.0 - cs_alpha) * self._smoothed_curve_safe
+        )
+        curve_safe = self._smoothed_curve_safe
+        self._curve_safe_speed = curve_safe
+
+        # Apply minimum-speed floor — but NOT when the model explicitly
+        # commands a stop (very short trajectory) and NOT above the
+        # curvature-safe speed.  This prevents the domain-gap-induced
+        # speed dips on clear roads while still respecting genuine stop
+        # commands and physics-limited curve speeds.
+        if not explicit_stop and self.min_speed_ms > 0:
+            effective_min = min(self.min_speed_ms, curve_safe)
+            desired_speed = max(desired_speed, effective_min)
+
+        # Hard-cap: never exceed the curvature-safe speed even if EMA
+        # or min-speed pushed it higher.  This is the physics limit.
+        if curve_safe < 100.0:
+            desired_speed = min(desired_speed, curve_safe)
+
         self._last_desired_speed = desired_speed
+
+        # ── Standstill tracker ──
+        if current_speed_ms < 0.1:
+            self._standstill_ticks += 1
+        else:
+            self._standstill_ticks = 0
 
         # ── Throttle / brake ──
         err = desired_speed - current_speed_ms
 
-        # Use a stricter (lower) stop threshold at standstill.
-        # The stochastic model frequently produces near-zero trajectories
-        # even when it "wants" to go.  At standstill, only brake when the
-        # EMA is clearly near zero; while moving, use a higher threshold
-        # so the car can actually come to a stop when needed.
-        stop_threshold = 0.10 if current_speed_ms < 0.5 else 0.30
+        at_standstill = current_speed_ms < 0.5
 
-        if desired_speed < stop_threshold:
-            # Model wants a stop
-            throttle = 0.0
-            brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
-        elif current_speed_ms < 0.5 and err > 0:
-            # At standstill with any positive speed target — apply enough
-            # throttle to overcome CARLA's static friction.  Even a small
-            # EMA desired speed (e.g. 0.15 m/s) means the model wants to
-            # move, so 0.1 cruise throttle is insufficient.
-            throttle = float(np.clip(err * 0.5, 0.35, 0.8))
-            brake = 0.0
-        elif err > 0.3:
-            # Need to accelerate (already moving)
-            throttle = float(np.clip(err * 0.3, 0.15, 0.8))
-            brake = 0.0
-        elif err < -1.0:
-            # Too fast – brake
-            throttle = 0.0
-            brake = float(np.clip(-err * 0.3, 0.1, 1.0))
+        if at_standstill:
+            # --- Standstill logic ---
+            # When already stopped, NEVER apply active brake — just
+            # release throttle.  The car won't roll on flat ground,
+            # and active braking prevents the occasional positive
+            # trajectory from producing any movement.
+            if desired_speed > 0.10:
+                # Model wants to go
+                throttle = float(np.clip(err * 0.5, 0.35, 0.8))
+                brake = 0.0
+            elif self._standstill_ticks >= self.STANDSTILL_NUDGE_TICKS:
+                # Stuck too long — apply a gentle nudge to give the
+                # diffusion model motion cues in its temporal frames.
+                # Many maps/spawns produce near-zero trajectories when
+                # all 4 temporal frames are identical (no motion).
+                throttle = self.STANDSTILL_NUDGE_THROTTLE
+                brake = 0.0
+            else:
+                # Desired speed ≈ 0 and not stuck yet — coast (no brake)
+                throttle = 0.0
+                brake = 0.0
         else:
-            # Cruise – maintain speed with light throttle
-            throttle = float(np.clip(desired_speed * 0.08, 0.1, 0.4))
-            brake = 0.0
+            # --- Moving logic (feed-forward + proportional) ---
+            #
+            # Pure proportional control (P-only) suffers from steady-
+            # state error: at equilibrium the throttle exactly cancels
+            # drag, leaving a permanent gap to the target speed.
+            #
+            # Fix: add a *feed-forward* term that estimates the base
+            # throttle needed to maintain ``desired_speed`` against drag.
+            # The proportional term then only needs to close the gap.
+            #
+            #   throttle = ff(desired_speed) + Kp * max(err, 0)
+            #
+            # Empirically, CARLA's Mercedes coupe needs approximately
+            # 0.07 × speed_ms throttle to hold a given speed on flat
+            # road (this absorbs rolling + aero drag).
+            _FF_COEFF = 0.07   # feed-forward coefficient
+            _KP = 0.5          # proportional gain for positive error
+
+            stop_threshold = 0.30
+
+            if desired_speed < stop_threshold:
+                # Model wants a stop
+                throttle = 0.0
+                brake = float(np.clip(0.5 + current_speed_ms * 0.1, 0.3, 1.0))
+            elif err < -1.0:
+                # Way too fast — active braking
+                throttle = 0.0
+                brake = float(np.clip(-err * 0.3, 0.1, 1.0))
+            elif err < 0:
+                # Slightly above target — coast with reduced throttle
+                coast_thr = desired_speed * _FF_COEFF * 0.7
+                throttle = float(np.clip(coast_thr, 0.0, 0.3))
+                brake = 0.0
+            else:
+                # At or below target — feed-forward + proportional
+                ff = desired_speed * _FF_COEFF
+                p = err * _KP
+                throttle = float(np.clip(ff + p, 0.1, 0.8))
+                brake = 0.0
 
         ctrl = carla.VehicleControl(
             throttle=throttle,
@@ -246,48 +424,179 @@ class TrajectoryFollower:
         diffs = np.diff(traj, axis=0)
         return float(np.sum(np.linalg.norm(diffs, axis=1)))
 
-    def _find_lookahead_point(self) -> Optional[np.ndarray]:
-        """Interpolate to find the point at ``lookahead_distance`` along the trajectory."""
+    def _find_lookahead_point(
+        self,
+        override_distance: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        """Interpolate to find the point at the given distance along the trajectory."""
         traj = self.trajectory
         if traj is None:
             return None
+
+        la_dist = override_distance if override_distance is not None else self.lookahead_distance
 
         diffs = np.diff(traj, axis=0)
         seg_len = np.linalg.norm(diffs, axis=1)
         cum_dist = np.concatenate([[0.0], np.cumsum(seg_len)])
 
-        if cum_dist[-1] < self.lookahead_distance:
+        if cum_dist[-1] < la_dist:
             return traj[-1]
 
-        idx = int(np.searchsorted(cum_dist, self.lookahead_distance))
+        idx = int(np.searchsorted(cum_dist, la_dist))
         if idx >= len(traj):
             return traj[-1]
         if idx == 0:
             return traj[0]
 
-        frac = (self.lookahead_distance - cum_dist[idx - 1]) / (
+        frac = (la_dist - cum_dist[idx - 1]) / (
             cum_dist[idx] - cum_dist[idx - 1] + 1e-6
         )
         return traj[idx - 1] + frac * (traj[idx] - traj[idx - 1])
 
     def _estimate_desired_speed(self) -> float:
         """
-        Estimate desired speed from the trajectory's total displacement.
+        Estimate desired speed from the **local** speed profile of the
+        trajectory, rather than a global average.
 
-        Uses ``total_length / total_time`` — simple, robust, and avoids
-        the pitfall of early waypoints clustering near the origin when
-        the model predicts gradual acceleration.
+        The trajectory's waypoints are spaced at ``self.dt`` intervals.
+        The local speed at waypoint *i* is ``|wp[i+1] − wp[i]| / dt``.
+        We look at a window around the point that is ~1-2 seconds ahead
+        of the vehicle (roughly where the car will be soon) and return
+        the **median** speed in that window.  Median is robust against
+        single-waypoint noise.
+
+        Falls back to total_length / total_time if the trajectory is
+        very short (< 5 waypoints).
         """
         traj = self.trajectory
         if traj is None or len(traj) < 2:
             return 0.0
 
-        total_length = self._trajectory_length()
-        total_time = (len(traj) - 1) * self.dt   # e.g. 39 × 0.1 = 3.9 s
-        if total_time < 1e-6:
+        # Per-segment speeds
+        diffs = np.diff(traj, axis=0)                      # (T-1, 2)
+        seg_speeds = np.linalg.norm(diffs, axis=1) / self.dt  # (T-1,)
+
+        if len(seg_speeds) < 5:
+            # Too short for a meaningful local window — use global avg
+            total_length = float(np.sum(np.linalg.norm(diffs, axis=1)))
+            total_time = (len(traj) - 1) * self.dt
+            return total_length / max(total_time, 1e-6)
+
+        # Window: waypoints 5..25 (≈ 0.5s – 2.5s ahead).
+        # This captures the "near future" where the car should match
+        # the trajectory's speed.  Waypoints 0-4 are very close to the
+        # origin and often noisy; waypoints 25+ are far ahead and may
+        # reflect conditions the car won't reach for many seconds.
+        win_start = min(5, len(seg_speeds) - 1)
+        win_end = min(25, len(seg_speeds))
+        window = seg_speeds[win_start:win_end]
+
+        if len(window) == 0:
+            window = seg_speeds
+
+        return float(np.median(window))
+
+    def _estimate_max_curvature(self) -> float:
+        """
+        Estimate the maximum curvature (1/R) in the stored trajectory.
+
+        Uses the Menger curvature formula on consecutive triplets of
+        waypoints:  κ = 4·Area / (a·b·c).
+
+        The 2-D cross product ``|d01 × d02|`` gives *twice* the
+        triangle area, so κ = 2·|cross| / (a·b·c).
+
+        Returns 0 if the trajectory is too short.
+        """
+        traj = self.trajectory
+        if traj is None or len(traj) < 3:
             return 0.0
 
-        return total_length / total_time
+        # Sample every few points to be robust against noise
+        step = max(1, len(traj) // 20)
+        indices = list(range(0, len(traj) - 2 * step, step))
+        if not indices:
+            return 0.0
+
+        max_k = 0.0
+        for i in indices:
+            p0 = traj[i]
+            p1 = traj[i + step]
+            p2 = traj[i + 2 * step]
+            # Triangle area via cross product:  |cross| = 2 * area
+            d01 = p1 - p0
+            d02 = p2 - p0
+            cross = abs(float(d01[0] * d02[1] - d01[1] * d02[0]))
+            a = float(np.linalg.norm(d01))
+            b = float(np.linalg.norm(p2 - p1))
+            c = float(np.linalg.norm(d02))
+            denom = a * b * c
+            if denom < 1e-6:
+                continue
+            # Menger curvature:  κ = 4·area / (a·b·c) = 2·|cross| / (a·b·c)
+            k = 2.0 * cross / denom
+            max_k = max(max_k, k)
+        return max_k
+
+    def _heading_based_steer(self, current_speed_ms: float) -> float:
+        """
+        Compute a steering command from the trajectory's heading profile.
+
+        Strategy: look at the heading at a point ~1-2 seconds ahead in the
+        trajectory and compute the yaw change needed.  Convert that to a
+        normalised steering command via the bicycle model:
+
+            steer_rad = arctan(yaw_rate × wheelbase / speed)
+
+        where yaw_rate ≈ Δheading / Δt.
+
+        This gives a more direct measure of how sharply the road curves
+        than Pure Pursuit, which is biased by the lookahead distance.
+        """
+        traj = self.trajectory
+        headings = self.headings
+        if traj is None or headings is None or len(headings) < 5:
+            return 0.0
+
+        # Pick a "look-ahead" index in time:
+        #   At 8 m/s (~30 km/h), we want ~1.5 s ahead → index 15
+        #   At 3 m/s (~10 km/h), we want ~0.8 s ahead → index 8
+        #   Clamp to valid range.
+        look_time = np.clip(0.15 * current_speed_ms + 0.5, 0.5, 2.0)  # seconds
+        look_idx = int(look_time / self.dt)
+        look_idx = min(look_idx, len(headings) - 1)
+
+        # Heading at origin is 0 (facing forward in rig frame).
+        # heading[i] is the heading at waypoint i.
+        target_heading = float(headings[look_idx])
+
+        # Wrap to [-π, π]
+        target_heading = (target_heading + np.pi) % (2.0 * np.pi) - np.pi
+
+        # Geometric approach: compute the arc-length to the look-ahead
+        # waypoint, then estimate the curvature needed to sweep the
+        # heading angle θ over that distance d:
+        #   κ = 2 sin(θ) / d    (chord-based approximation)
+        # Then convert to steering via the bicycle model.
+        look_d = 0.0
+        for i in range(min(look_idx, len(traj) - 1)):
+            look_d += float(np.linalg.norm(traj[i + 1] - traj[i]))
+
+        if look_d < 0.3:
+            return 0.0
+
+        # Required curvature to sweep heading θ over distance d:
+        #   κ = 2 sin(θ) / d  (chord-based approximation)
+        sin_th = np.sin(target_heading)
+        kappa = 2.0 * sin_th / look_d
+
+        steer_rad = np.arctan(kappa * self.wheelbase)
+        hdg_steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
+
+        # Flip: rig Y-left positive → CARLA steer-right positive
+        hdg_steer = -hdg_steer
+
+        return hdg_steer
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +647,66 @@ class CarlaAlpamayoAgent:
         print(f"Connecting to CARLA at {self.config.host}:{self.config.port}...")
         self.client = carla.Client(self.config.host, self.config.port)
         self.client.set_timeout(self.config.timeout)
-        self.world = self.client.get_world()
-        self.spectator = self.world.get_spectator()
         print(f"Connected to CARLA {self.client.get_server_version()}")
+
+        # Load requested map if specified
+        if self.config.map_name:
+            current_map = self.client.get_world().get_map().name
+            target = self.config.map_name
+            # CARLA map names may include a path prefix (e.g. "Carla/Maps/Town03")
+            if not current_map.endswith(target):
+                print(f"Loading map {target} (current: {current_map})...")
+                self.client.set_timeout(60.0)  # map load can be slow
+                self.world = self.client.load_world(target)
+                self.client.set_timeout(self.config.timeout)
+            else:
+                print(f"Map {target} already loaded.")
+                self.world = self.client.get_world()
+        else:
+            self.world = self.client.get_world()
+
+        self.spectator = self.world.get_spectator()
         print(f"Map: {self.world.get_map().name}")
+
+        # Apply weather
+        self._apply_weather(self.config.weather)
+
+    # Supported weather presets (CARLA built-in)
+    WEATHER_PRESETS = {
+        "ClearNoon":      carla.WeatherParameters.ClearNoon,
+        "CloudyNoon":     carla.WeatherParameters.CloudyNoon,
+        "WetNoon":        carla.WeatherParameters.WetNoon,
+        "WetCloudyNoon":  carla.WeatherParameters.WetCloudyNoon,
+        "SoftRainNoon":   carla.WeatherParameters.SoftRainNoon,
+        "MidRainyNoon":   carla.WeatherParameters.MidRainyNoon,
+        "HardRainNoon":   carla.WeatherParameters.HardRainNoon,
+        "ClearSunset":    carla.WeatherParameters.ClearSunset,
+        "CloudySunset":   carla.WeatherParameters.CloudySunset,
+        "WetSunset":      carla.WeatherParameters.WetSunset,
+        "WetCloudySunset": carla.WeatherParameters.WetCloudySunset,
+        "SoftRainSunset": carla.WeatherParameters.SoftRainSunset,
+        "MidRainSunset":  carla.WeatherParameters.MidRainSunset,
+        "HardRainSunset": carla.WeatherParameters.HardRainSunset,
+    }
+
+    def _apply_weather(self, preset_name: str) -> None:
+        """Apply a weather preset and ensure dry roads (no puddles)."""
+        if preset_name in self.WEATHER_PRESETS:
+            weather = self.WEATHER_PRESETS[preset_name]
+        else:
+            available = ", ".join(sorted(self.WEATHER_PRESETS.keys()))
+            raise ValueError(
+                f"Unknown weather preset '{preset_name}'. "
+                f"Available: {available}"
+            )
+
+        # Force-remove puddles / standing water regardless of preset.
+        # precipitation_deposits controls wetness on the road surface
+        # (0 = completely dry, 100 = fully wet).
+        weather.precipitation_deposits = 0.0
+
+        self.world.set_weather(weather)
+        print(f"Weather: {preset_name} (roads dry, no puddles)")
 
     def spawn_vehicle(self) -> carla.Actor:
         import random
@@ -415,6 +780,8 @@ class CarlaAlpamayoAgent:
         self.alpamayo = AlpamayoWrapper(
             model_name=self.config.model_name,
             num_traj_samples=self.config.num_traj_samples,
+            top_p=self.config.vlm_top_p,
+            temperature=self.config.vlm_temperature,
         )
         if self.config.use_dummy_model:
             print("Using dummy model for testing (no GPU required)")
@@ -432,6 +799,8 @@ class CarlaAlpamayoAgent:
         self.follower = TrajectoryFollower(
             lookahead_distance=self.config.lookahead_distance,
             max_speed_kmh=self.config.max_speed_kmh,
+            min_speed_kmh=self.config.min_speed_kmh,
+            steer_gain=self.config.steer_gain,
         )
 
         # Trajectory optimiser (optional post-processing)
@@ -786,12 +1155,34 @@ class CarlaAlpamayoAgent:
                     if self.last_opt_result is not None:
                         r = self.last_opt_result
                         opt_tag = f" Opt:{'OK' if r.success else 'FAIL'}"
+                    nudge_tag = ""
+                    stall = self.follower._standstill_ticks
+                    if stall >= self.follower.STANDSTILL_NUDGE_TICKS:
+                        nudge_tag = " NUDGE"
+                    elif stall > 0 and st["speed_kmh"] < 1.0:
+                        nudge_tag = f" stall:{stall}"
+                    steer_raw = self.follower._raw_steer
+                    steer_ema = self.follower._last_steer
+                    # Majority-vote info from last inference
+                    vote_tag = ""
+                    if output and output.all_trajectories_xy is not None:
+                        from .alpamayo_wrapper_nxt import AlpamayoWrapper
+                        n_go = sum(
+                            1 for t in output.all_trajectories_xy
+                            if AlpamayoWrapper._traj_length(t) >= AlpamayoWrapper._GO_THRESHOLD
+                        )
+                        n_tot = len(output.all_trajectories_xy)
+                        vote_tag = f" go:{n_go}/{n_tot}"
+                    curv_spd = self.follower._curve_safe_speed
+                    curv_tag = f" curv:{curv_spd:.1f}m/s" if curv_spd < 90 else ""
+                    hw = self.follower._hdg_weight
+                    hdg_tag = f" hdg:{hw:.0%}" if hw > 0.05 else ""
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
                         f"({self.last_inference_time:.2f}s) | "
                         f"Spd {st['speed_kmh']:5.1f} | "
-                        f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} | "
-                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{opt_tag} | {cot}"
+                        f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} Str {steer_ema:+.2f} | "
+                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{vote_tag}{curv_tag}{hdg_tag}{opt_tag}{nudge_tag} | {cot}"
                     )
                 tick += 1
 

@@ -1,0 +1,736 @@
+"""
+CARLA Alpamayo Observer (NXT) — Open-Loop Evaluation Mode
+
+Runs the CARLA autopilot to drive the vehicle while simultaneously
+feeding the camera images to Alpamayo-R1 for inference.  The model's
+predicted trajectory and chain-of-thought reasoning are displayed
+alongside the actual driving behaviour, but *never* used for control.
+
+Key characteristics:
+  - Vehicle is driven by CARLA's TrafficManager autopilot
+  - Alpamayo inference runs in a background thread (non-blocking)
+  - Simulation time advances continuously during inference
+  - Results are displayed with a "delay" label showing how many ticks
+    have elapsed since the input was captured
+
+This allows qualitative evaluation of Alpamayo's perception and
+planning ability without any feedback from the model to the vehicle.
+"""
+
+import carla
+import numpy as np
+import torch
+import time
+import threading
+import copy
+from typing import Dict, Optional
+from dataclasses import dataclass
+from collections import deque
+from scipy.spatial.transform import Rotation
+
+from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
+from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
+from .display_nxt import Display
+
+# ---------------------------------------------------------------------------
+# Constants (same as agent — must match Alpamayo-R1 expectations)
+# ---------------------------------------------------------------------------
+NUM_HISTORY_STEPS = 16    # ego history length
+HISTORY_TIME_STEP = 0.1   # seconds between history samples
+
+# CARLA rear-axle offset from bounding-box center in vehicle-local frame.
+_REAR_AXLE_OFFSET_LOCAL = np.array([-1.389, 0.0, 0.0])
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+@dataclass
+class EgoPose:
+    timestamp_us: int
+    location: np.ndarray          # (3,) world x y z
+    rotation_matrix: np.ndarray   # (3, 3) world rotation
+
+
+@dataclass
+class ObserverConfig:
+    """Configuration for the open-loop observer."""
+    # CARLA connection
+    host: str = "localhost"
+    port: int = 2000
+    timeout: float = 10.0
+    map_name: Optional[str] = None
+    weather: str = "ClearNoon"
+
+    # Vehicle
+    vehicle_filter: str = "vehicle.mercedes.coupe_2020"
+    spawn_point_index: int = -1   # -1 = random
+
+    # Autopilot
+    autopilot_speed_pct: float = -20.0
+    # Negative → faster than limit, positive → slower.
+    # TrafficManager's vehicle_percentage_speed_difference semantics:
+    #   0 → limit speed, -20 → 20% above limit, 30 → 30% below limit.
+
+    # Alpamayo model
+    model_name: str = "nvidia/Alpamayo-R1-10B"
+    use_dummy_model: bool = False
+    context_length: int = 4
+    num_traj_samples: int = 6
+    max_generation_length: int = 64
+    diffusion_steps: int = 5
+    cam_resolution: str = "full"
+    vlm_temperature: float = 0.6
+    vlm_top_p: float = 0.98
+
+    # Simulation
+    sim_fps: float = 10.0
+
+    # Display
+    enable_display: bool = True
+    record_path: Optional[str] = None
+    record_crf: int = 23
+
+
+# ---------------------------------------------------------------------------
+# Inference worker (runs in background thread)
+# ---------------------------------------------------------------------------
+@dataclass
+class _InferenceRequest:
+    """Payload sent from main thread → inference thread."""
+    camera_frames: Dict[str, list]    # camera_name → list of HWC images
+    ego_history_xyz: torch.Tensor     # (1,1,16,3)
+    ego_history_rot: torch.Tensor     # (1,1,16,3,3)
+    submit_tick: int                  # simulation tick when this was captured
+
+
+@dataclass
+class _InferenceResult:
+    """Payload returned from inference thread → main thread."""
+    output: AlpamayoOutput
+    submit_tick: int                  # tick when input was captured
+    inference_time: float             # wall-clock seconds
+
+
+def _inference_worker(
+    model: AlpamayoWrapper,
+    config: ObserverConfig,
+    request_event: threading.Event,
+    result_event: threading.Event,
+    shared: dict,
+    stop_event: threading.Event,
+) -> None:
+    """Background thread that runs Alpamayo inference.
+
+    Communication via ``shared`` dict protected by events:
+      - Main sets shared["request"] and signals request_event
+      - Worker reads request, runs inference, sets shared["result"],
+        signals result_event
+    """
+    while not stop_event.is_set():
+        # Wait for a request (with timeout to allow stop check)
+        if not request_event.wait(timeout=0.1):
+            continue
+        request_event.clear()
+
+        req: Optional[_InferenceRequest] = shared.get("request")
+        if req is None:
+            continue
+
+        t0 = time.perf_counter()
+        if config.use_dummy_model:
+            output = model.predict_dummy()
+        else:
+            output = model.predict(
+                camera_frames=req.camera_frames,
+                ego_history_xyz=req.ego_history_xyz,
+                ego_history_rot=req.ego_history_rot,
+                max_generation_length=config.max_generation_length,
+                diffusion_steps=config.diffusion_steps,
+            )
+        elapsed = time.perf_counter() - t0
+
+        shared["result"] = _InferenceResult(
+            output=output,
+            submit_tick=req.submit_tick,
+            inference_time=elapsed,
+        )
+        result_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Supported weather presets (same as agent)
+# ---------------------------------------------------------------------------
+WEATHER_PRESETS = {
+    "ClearNoon":      carla.WeatherParameters.ClearNoon,
+    "CloudyNoon":     carla.WeatherParameters.CloudyNoon,
+    "WetNoon":        carla.WeatherParameters.WetNoon,
+    "WetCloudyNoon":  carla.WeatherParameters.WetCloudyNoon,
+    "SoftRainNoon":   carla.WeatherParameters.SoftRainNoon,
+    "MidRainyNoon":   carla.WeatherParameters.MidRainyNoon,
+    "HardRainNoon":   carla.WeatherParameters.HardRainNoon,
+    "ClearSunset":    carla.WeatherParameters.ClearSunset,
+    "CloudySunset":   carla.WeatherParameters.CloudySunset,
+    "WetSunset":      carla.WeatherParameters.WetSunset,
+    "WetCloudySunset": carla.WeatherParameters.WetCloudySunset,
+    "SoftRainSunset": carla.WeatherParameters.SoftRainSunset,
+    "MidRainSunset":  carla.WeatherParameters.MidRainSunset,
+    "HardRainSunset": carla.WeatherParameters.HardRainSunset,
+}
+
+
+# ---------------------------------------------------------------------------
+# Main observer class
+# ---------------------------------------------------------------------------
+class CarlaObserver:
+    """
+    Open-loop observer: CARLA autopilot drives, Alpamayo watches.
+
+    Lifecycle::
+
+        with CarlaObserver(config) as obs:
+            obs.run(max_ticks=3000)
+    """
+
+    def __init__(self, config: Optional[ObserverConfig] = None):
+        self.config = config or ObserverConfig()
+
+        # CARLA handles
+        self.client: Optional[carla.Client] = None
+        self.world: Optional[carla.World] = None
+        self.vehicle: Optional[carla.Actor] = None
+        self.spectator: Optional[carla.Actor] = None
+        self.traffic_manager: Optional[carla.TrafficManager] = None
+
+        # Sub-components
+        self.sensor_manager: Optional[SensorManager] = None
+        self.alpamayo: Optional[AlpamayoWrapper] = None
+        self.display: Optional[Display] = None
+
+        # Ego-history ring buffer (world-frame poses)
+        self.ego_history: deque[EgoPose] = deque(maxlen=512)
+
+        # Actual vehicle path (world coords, for BEV display)
+        self.actual_path: deque[np.ndarray] = deque(maxlen=500)
+
+        # Inference state
+        self.inference_count = 0
+        self.tick_count = 0
+        self.last_output: Optional[AlpamayoOutput] = None
+        self.last_inference_time: float = 0.0
+        self.last_result_tick: int = 0          # tick when the last result input was captured
+        self.inference_busy: bool = False
+
+        # Threading
+        self._request_event = threading.Event()
+        self._result_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._shared: dict = {}
+        self._worker_thread: Optional[threading.Thread] = None
+
+    # ==================================================================
+    # Initialisation
+    # ==================================================================
+
+    def connect(self) -> None:
+        cfg = self.config
+        print(f"Connecting to CARLA at {cfg.host}:{cfg.port}...")
+        self.client = carla.Client(cfg.host, cfg.port)
+        self.client.set_timeout(cfg.timeout)
+        print(f"Connected to CARLA {self.client.get_server_version()}")
+
+        if cfg.map_name:
+            current_map = self.client.get_world().get_map().name
+            if not current_map.endswith(cfg.map_name):
+                print(f"Loading map {cfg.map_name} (current: {current_map})...")
+                self.client.set_timeout(60.0)
+                self.world = self.client.load_world(cfg.map_name)
+                self.client.set_timeout(cfg.timeout)
+            else:
+                print(f"Map {cfg.map_name} already loaded.")
+                self.world = self.client.get_world()
+        else:
+            self.world = self.client.get_world()
+
+        self.spectator = self.world.get_spectator()
+        print(f"Map: {self.world.get_map().name}")
+
+        # Weather
+        self._apply_weather(cfg.weather)
+
+    def _apply_weather(self, preset_name: str) -> None:
+        if preset_name in WEATHER_PRESETS:
+            weather = WEATHER_PRESETS[preset_name]
+        else:
+            available = ", ".join(sorted(WEATHER_PRESETS.keys()))
+            raise ValueError(
+                f"Unknown weather preset '{preset_name}'. Available: {available}"
+            )
+        weather.precipitation_deposits = 0.0
+        self.world.set_weather(weather)
+        print(f"Weather: {preset_name} (roads dry, no puddles)")
+
+    def spawn_vehicle(self) -> carla.Actor:
+        import random
+
+        bp_lib = self.world.get_blueprint_library()
+        bps = bp_lib.filter(self.config.vehicle_filter)
+        if not bps:
+            bps = bp_lib.filter("vehicle.*")
+        bp = bps[0]
+
+        spawns = self.world.get_map().get_spawn_points()
+        if not spawns:
+            raise RuntimeError("No spawn points available")
+
+        idx = self.config.spawn_point_index
+        if idx < 0:
+            random.shuffle(spawns)
+            for sp in spawns[:10]:
+                try:
+                    self.vehicle = self.world.spawn_actor(bp, sp)
+                    print(f"Spawned vehicle: {bp.id} at {sp.location} (random)")
+                    return self.vehicle
+                except RuntimeError:
+                    continue
+            raise RuntimeError("Could not find a free spawn point")
+        else:
+            idx = min(idx, len(spawns) - 1)
+            sp = spawns[idx]
+            self.vehicle = self.world.spawn_actor(bp, sp)
+            print(f"Spawned vehicle: {bp.id} at {sp.location} (index={idx})")
+            return self.vehicle
+
+    def _enable_autopilot(self) -> None:
+        """Enable CARLA TrafficManager autopilot on the ego vehicle."""
+        tm_port = 8000
+        self.traffic_manager = self.client.get_trafficmanager(tm_port)
+        self.traffic_manager.set_synchronous_mode(True)
+
+        self.vehicle.set_autopilot(True, tm_port)
+
+        # Speed offset: negative = faster than speed limit
+        self.traffic_manager.vehicle_percentage_speed_difference(
+            self.vehicle, self.config.autopilot_speed_pct,
+        )
+
+        # Safe defaults
+        self.traffic_manager.auto_lane_change(self.vehicle, True)
+        self.traffic_manager.distance_to_leading_vehicle(self.vehicle, 3.0)
+
+        print(f"Autopilot enabled (speed offset: {self.config.autopilot_speed_pct}%)")
+
+    @staticmethod
+    def _parse_cam_resolution(value: str) -> Optional[tuple]:
+        if value == "full":
+            return None
+        if value in RESOLUTION_PRESETS:
+            return RESOLUTION_PRESETS[value]
+        if "x" in value:
+            parts = value.split("x")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                return (int(parts[0]), int(parts[1]))
+        raise ValueError(
+            f"Invalid cam_resolution '{value}'. "
+            f"Use 'full', 'half', 'low', or 'WxH' (e.g. '640x360')."
+        )
+
+    def setup_sensors(self) -> None:
+        target_frame_dt = HISTORY_TIME_STEP
+        sim_dt = 1.0 / self.config.sim_fps
+        subsample_factor = max(1, round(target_frame_dt / sim_dt))
+
+        cam_res = self._parse_cam_resolution(self.config.cam_resolution)
+
+        self.sensor_manager = SensorManager(
+            self.world,
+            self.vehicle,
+            subsample_factor=subsample_factor,
+            cam_resolution=cam_res,
+        )
+        self.sensor_manager.spawn_default_sensors()
+
+    def load_alpamayo(self) -> None:
+        self.alpamayo = AlpamayoWrapper(
+            model_name=self.config.model_name,
+            num_traj_samples=self.config.num_traj_samples,
+            top_p=self.config.vlm_top_p,
+            temperature=self.config.vlm_temperature,
+        )
+        if self.config.use_dummy_model:
+            print("Using dummy model for testing (no GPU required)")
+        else:
+            print("Loading Alpamayo model (this may take several minutes)...")
+            self.alpamayo.load_model()
+
+    def initialize(self) -> None:
+        """Full initialisation sequence."""
+        self.connect()
+        self.spawn_vehicle()
+        self.setup_sensors()
+        self.load_alpamayo()
+
+        # Synchronous mode
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 1.0 / self.config.sim_fps
+        self.world.apply_settings(settings)
+
+        # Enable autopilot AFTER synchronous mode is set
+        self._enable_autopilot()
+
+        # Start inference worker thread
+        self._worker_thread = threading.Thread(
+            target=_inference_worker,
+            args=(
+                self.alpamayo,
+                self.config,
+                self._request_event,
+                self._result_event,
+                self._shared,
+                self._stop_event,
+            ),
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+        # Pygame display
+        if self.config.enable_display:
+            self.display = Display(
+                record_path=self.config.record_path,
+                record_fps=self.config.sim_fps,
+                record_crf=self.config.record_crf,
+            )
+
+        print("Observer initialised successfully!")
+
+    # ==================================================================
+    # Ego history (same logic as agent)
+    # ==================================================================
+
+    def _record_ego_pose(self) -> None:
+        transform = self.vehicle.get_transform()
+        snap = self.world.get_snapshot()
+        timestamp_us = int(snap.timestamp.elapsed_seconds * 1_000_000)
+
+        loc = transform.location
+        center_world = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
+
+        rot = transform.rotation
+        r = Rotation.from_euler(
+            "ZYX", [rot.yaw, rot.pitch, rot.roll], degrees=True
+        )
+        rotation_matrix = r.as_matrix()
+
+        rear_axle_world = center_world + rotation_matrix @ _REAR_AXLE_OFFSET_LOCAL
+
+        self.ego_history.append(
+            EgoPose(
+                timestamp_us=timestamp_us,
+                location=rear_axle_world,
+                rotation_matrix=rotation_matrix,
+            )
+        )
+
+        # Also record for actual path display (world XY)
+        self.actual_path.append(center_world[:2].copy())
+
+    def _build_ego_history_tensors(
+        self,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        step_interval = max(1, round(HISTORY_TIME_STEP * self.config.sim_fps))
+        required_len = (NUM_HISTORY_STEPS - 1) * step_interval + 1
+
+        if len(self.ego_history) < required_len:
+            return None
+
+        current = self.ego_history[-1]
+        R_cur_inv = current.rotation_matrix.T
+
+        F = np.diag([1.0, -1.0, 1.0])
+
+        history_xyz = []
+        history_rot = []
+
+        for i in range(NUM_HISTORY_STEPS - 1, -1, -1):
+            buf_idx = len(self.ego_history) - 1 - i * step_interval
+            buf_idx = max(buf_idx, 0)
+            pose = self.ego_history[buf_idx]
+
+            delta_world = pose.location - current.location
+            delta_local = R_cur_inv @ delta_world
+            delta_rig = F @ delta_local
+            history_xyz.append(delta_rig)
+
+            R_rel = R_cur_inv @ pose.rotation_matrix
+            R_rel_rig = F @ R_rel @ F
+            history_rot.append(R_rel_rig)
+
+        ego_xyz = (
+            torch.from_numpy(np.array(history_xyz, dtype=np.float32))
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+        ego_rot = (
+            torch.from_numpy(np.array(history_rot, dtype=np.float32))
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+        return ego_xyz, ego_rot
+
+    # ==================================================================
+    # Image preparation
+    # ==================================================================
+
+    def _prepare_camera_frames(self) -> Optional[Dict[str, list]]:
+        all_cam_frames = self.sensor_manager.get_all_camera_frames(
+            count=self.config.context_length
+        )
+        if all_cam_frames is None:
+            return None
+
+        result: Dict[str, list] = {}
+        for cam_name in ALPAMAYO_CAMERA_ORDER:
+            result[cam_name] = [f.image for f in all_cam_frames[cam_name]]
+        return result
+
+    def _get_latest_camera_images(self) -> Dict[str, np.ndarray]:
+        images: Dict[str, np.ndarray] = {}
+        for cam_name in ALPAMAYO_CAMERA_ORDER:
+            frames = self.sensor_manager.get_buffered_frames(cam_name, count=1)
+            if frames:
+                images[cam_name] = frames[-1].image
+        return images
+
+    # ==================================================================
+    # Vehicle state
+    # ==================================================================
+
+    def get_vehicle_state(self) -> Dict:
+        vel = self.vehicle.get_velocity()
+        tr = self.vehicle.get_transform()
+        ctrl = self.vehicle.get_control()
+        speed_ms = np.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+        return {
+            "speed_kmh": speed_ms * 3.6,
+            "speed_ms": speed_ms,
+            "location": {"x": tr.location.x, "y": tr.location.y, "z": tr.location.z},
+            "rotation": {
+                "pitch": tr.rotation.pitch,
+                "yaw": tr.rotation.yaw,
+                "roll": tr.rotation.roll,
+            },
+            "throttle": ctrl.throttle,
+            "brake": ctrl.brake,
+            "steer": ctrl.steer,
+        }
+
+    # ==================================================================
+    # Build actual-path in rig-frame for BEV display
+    # ==================================================================
+
+    def _actual_path_in_rig(self, max_points: int = 60) -> Optional[np.ndarray]:
+        """Convert recent actual path to rig frame for BEV overlay.
+
+        Returns (N, 2) array in rig frame (X forward, Y left) or None.
+        """
+        if len(self.actual_path) < 2 or len(self.ego_history) < 1:
+            return None
+
+        current = self.ego_history[-1]
+        R_inv = current.rotation_matrix.T
+        F = np.diag([1.0, -1.0, 1.0])
+
+        # Take recent N points
+        path_list = list(self.actual_path)[-max_points:]
+        rig_points = []
+        for pt_world in path_list:
+            # Extend to 3D (z=0)
+            pt3 = np.array([pt_world[0], pt_world[1], current.location[2]])
+            delta = pt3 - current.location
+            delta_local = R_inv @ delta
+            delta_rig = F @ delta_local
+            rig_points.append(delta_rig[:2])
+
+        return np.array(rig_points)
+
+    # ==================================================================
+    # Main loop
+    # ==================================================================
+
+    def run(
+        self,
+        max_ticks: int = 3000,
+        verbose: bool = True,
+    ) -> None:
+        cfg = self.config
+
+        print(f"Starting open-loop observation (autopilot driving, {cfg.sim_fps} Hz)")
+        print("Press Ctrl+C to stop\n")
+
+        # --- warm-up: collect enough sensor data & ego history ---
+        step_interval = max(1, round(HISTORY_TIME_STEP * cfg.sim_fps))
+        subsample_factor = self.sensor_manager.subsample_factor
+        min_cam_ticks = (cfg.context_length - 1) * subsample_factor + 2
+        warmup_ticks = max(
+            min_cam_ticks,
+            (NUM_HISTORY_STEPS - 1) * step_interval + 4,
+        )
+        print(f"Warming up for {warmup_ticks} ticks...")
+        for _ in range(warmup_ticks):
+            self.world.tick()
+            self._record_ego_pose()
+            time.sleep(0.01)
+        print("Warm-up complete — entering observation loop.\n")
+
+        try:
+            for tick in range(max_ticks):
+                self.world.tick()
+                self._record_ego_pose()
+                self.tick_count += 1
+
+                # --- Check for completed inference result ---
+                if self._result_event.is_set():
+                    self._result_event.clear()
+                    result: Optional[_InferenceResult] = self._shared.get("result")
+                    if result is not None:
+                        self.last_output = result.output
+                        self.last_inference_time = result.inference_time
+                        self.last_result_tick = result.submit_tick
+                        self.inference_count += 1
+                        self.inference_busy = False
+
+                # --- Submit new inference if idle and data ready ---
+                if not self.inference_busy:
+                    cam_frames = self._prepare_camera_frames()
+                    hist = self._build_ego_history_tensors()
+                    if cam_frames is not None and hist is not None:
+                        ego_xyz, ego_rot = hist
+                        self._shared["request"] = _InferenceRequest(
+                            camera_frames=cam_frames,
+                            ego_history_xyz=ego_xyz,
+                            ego_history_rot=ego_rot,
+                            submit_tick=self.tick_count,
+                        )
+                        self._request_event.set()
+                        self.inference_busy = True
+
+                # --- Update spectator ---
+                self._update_spectator()
+
+                # --- Display ---
+                if self.display is not None:
+                    state = self.get_vehicle_state()
+                    output = self.last_output
+
+                    # Delay in ticks since the input was captured
+                    delay_ticks = (
+                        self.tick_count - self.last_result_tick
+                        if self.last_result_tick > 0 else -1
+                    )
+
+                    traj_xy = output.trajectory_xy if output else None
+                    reasoning = output.reasoning if output else None
+                    all_traj = output.all_trajectories_xy if output else None
+                    sel_idx = output.selected_index if output else 0
+
+                    actual_rig = self._actual_path_in_rig()
+
+                    self.display.tick(
+                        camera_images=self._get_latest_camera_images(),
+                        vehicle_state=state,
+                        trajectory_xy=traj_xy,
+                        reasoning=reasoning,
+                        inference_count=self.inference_count,
+                        tick_count=self.tick_count,
+                        inference_time=self.last_inference_time,
+                        all_trajectories_xy=all_traj,
+                        selected_traj_index=sel_idx,
+                        # Observer-specific extras
+                        observer_mode=True,
+                        delay_ticks=delay_ticks,
+                        actual_path_rig=actual_rig,
+                        autopilot_state=state,
+                    )
+                    if self.display.should_quit:
+                        print("Display closed — stopping.")
+                        break
+
+                # --- Console log ---
+                if verbose and self.tick_count % 5 == 0:
+                    st = self.get_vehicle_state()
+                    delay = (
+                        self.tick_count - self.last_result_tick
+                        if self.last_result_tick > 0 else -1
+                    )
+                    busy_tag = " [inferring]" if self.inference_busy else ""
+                    cot = ""
+                    if self.last_output and self.last_output.reasoning:
+                        cot = self.last_output.reasoning[:55].replace("\n", " ") + "…"
+                    print(
+                        f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
+                        f"({self.last_inference_time:.2f}s) | "
+                        f"Spd {st['speed_kmh']:5.1f} | "
+                        f"Thr {st['throttle']:.2f} Brk {st['brake']:.2f} "
+                        f"Str {st['steer']:+.2f} | "
+                        f"Delay {delay:3d}tick{busy_tag} | {cot}"
+                    )
+
+        except KeyboardInterrupt:
+            print("\nStopping…")
+        finally:
+            pass
+
+    def _update_spectator(self) -> None:
+        if not (self.vehicle and self.spectator):
+            return
+        tr = self.vehicle.get_transform()
+        yaw_rad = np.radians(tr.rotation.yaw)
+        self.spectator.set_transform(
+            carla.Transform(
+                carla.Location(
+                    x=tr.location.x - 8 * np.cos(yaw_rad),
+                    y=tr.location.y - 8 * np.sin(yaw_rad),
+                    z=tr.location.z + 4,
+                ),
+                carla.Rotation(pitch=-15, yaw=tr.rotation.yaw),
+            )
+        )
+
+    # ==================================================================
+    # Cleanup / context manager
+    # ==================================================================
+
+    def cleanup(self) -> None:
+        print("Cleaning up…")
+
+        # Stop inference thread
+        self._stop_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5.0)
+
+        if self.display:
+            self.display.close()
+            self.display = None
+        if self.sensor_manager:
+            self.sensor_manager.destroy_all()
+        if self.vehicle and self.vehicle.is_alive:
+            self.vehicle.set_autopilot(False)
+            self.vehicle.destroy()
+            print("Destroyed vehicle")
+        if self.world:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+        if self.traffic_manager:
+            self.traffic_manager.set_synchronous_mode(False)
+        print("Cleanup complete")
+
+    def __enter__(self):
+        self.initialize()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False
+
