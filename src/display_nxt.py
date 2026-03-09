@@ -64,7 +64,7 @@ _TRAJ_CANDIDATE_COLORS = [           # palette for candidate trajectories
     (255, 180, 200),  # pink (fallback)
 ]
 _EGO_COLOR = (255, 255, 255)
-_ACTUAL_PATH_COLOR = (100, 160, 255)   # blue — actual vehicle path (observer)
+_ACTUAL_PATH_COLOR = (255, 150, 140)   # pastel red — actual vehicle path (observer)
 
 
 class Display:
@@ -503,7 +503,7 @@ class Display:
             lbl = self.font_xs.render("opt", True, _TRAJ_COLOR)
             self.screen.blit(lbl, (lx + 20, ly))
 
-        # Draw actual vehicle path (observer mode)
+        # Draw actual vehicle path LAST so it renders on top (observer mode)
         if actual_path_rig is not None and len(actual_path_rig) >= 2:
             actual_pts = _traj_to_points(actual_path_rig)
             pygame.draw.lines(self.screen, _ACTUAL_PATH_COLOR, False, actual_pts, 2)

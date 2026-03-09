@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import time
 import threading
-import copy
 from typing import Dict, Optional
 from dataclasses import dataclass
 from collections import deque
@@ -210,8 +209,10 @@ class CarlaObserver:
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
 
-        # Actual vehicle path (world coords, for BEV display)
-        self.actual_path: deque[np.ndarray] = deque(maxlen=500)
+        # Tick → EgoPose mapping for building comparison paths
+        self._pose_by_tick: dict[int, EgoPose] = {}
+        _POSE_HISTORY_LIMIT = 200   # keep at most this many ticks
+        self._pose_history_limit = _POSE_HISTORY_LIMIT
 
         # Inference state
         self.inference_count = 0
@@ -220,6 +221,14 @@ class CarlaObserver:
         self.last_inference_time: float = 0.0
         self.last_result_tick: int = 0          # tick when the last result input was captured
         self.inference_busy: bool = False
+
+        # Frozen comparison snapshot (updated only when inference completes)
+        self._frozen_actual_rig: Optional[np.ndarray] = None   # (N,2) actual path in rig
+        self._frozen_traj_xy: Optional[np.ndarray] = None       # (T,2) selected traj
+        self._frozen_all_traj: Optional[np.ndarray] = None      # (N,T,2) all candidates
+        self._frozen_sel_idx: int = 0
+        self._frozen_reasoning: Optional[str] = None
+        self._frozen_delay_ticks: int = -1
 
         # Threading
         self._request_event = threading.Event()
@@ -424,16 +433,20 @@ class CarlaObserver:
 
         rear_axle_world = center_world + rotation_matrix @ _REAR_AXLE_OFFSET_LOCAL
 
-        self.ego_history.append(
-            EgoPose(
-                timestamp_us=timestamp_us,
-                location=rear_axle_world,
-                rotation_matrix=rotation_matrix,
-            )
+        pose = EgoPose(
+            timestamp_us=timestamp_us,
+            location=rear_axle_world,
+            rotation_matrix=rotation_matrix,
         )
+        self.ego_history.append(pose)
 
-        # Also record for actual path display (world XY)
-        self.actual_path.append(center_world[:2].copy())
+        # Also record tick → pose for comparison path building
+        self._pose_by_tick[self.tick_count] = pose
+
+        # Prune old entries to avoid unbounded growth
+        if len(self._pose_by_tick) > self._pose_history_limit:
+            oldest = min(self._pose_by_tick.keys())
+            del self._pose_by_tick[oldest]
 
     def _build_ego_history_tensors(
         self,
@@ -526,32 +539,40 @@ class CarlaObserver:
         }
 
     # ==================================================================
-    # Build actual-path in rig-frame for BEV display
+    # Build comparison path: actual route from submit_tick → now,
+    # in the rig frame of the submit_tick pose.
     # ==================================================================
 
-    def _actual_path_in_rig(self, max_points: int = 60) -> Optional[np.ndarray]:
-        """Convert recent actual path to rig frame for BEV overlay.
+    def _build_actual_path_from_submit(
+        self, submit_tick: int,
+    ) -> Optional[np.ndarray]:
+        """Build the actual vehicle path from *submit_tick* to now,
+        transformed into the rig frame of the submit_tick pose.
+
+        This makes the actual path directly comparable with Alpamayo's
+        prediction, which is also in that same rig frame.
 
         Returns (N, 2) array in rig frame (X forward, Y left) or None.
         """
-        if len(self.actual_path) < 2 or len(self.ego_history) < 1:
+        ref_pose = self._pose_by_tick.get(submit_tick)
+        if ref_pose is None:
             return None
 
-        current = self.ego_history[-1]
-        R_inv = current.rotation_matrix.T
+        R_inv = ref_pose.rotation_matrix.T
         F = np.diag([1.0, -1.0, 1.0])
 
-        # Take recent N points
-        path_list = list(self.actual_path)[-max_points:]
         rig_points = []
-        for pt_world in path_list:
-            # Extend to 3D (z=0)
-            pt3 = np.array([pt_world[0], pt_world[1], current.location[2]])
-            delta = pt3 - current.location
-            delta_local = R_inv @ delta
+        for t in range(submit_tick, self.tick_count + 1):
+            pose = self._pose_by_tick.get(t)
+            if pose is None:
+                continue
+            delta_world = pose.location - ref_pose.location
+            delta_local = R_inv @ delta_world
             delta_rig = F @ delta_local
             rig_points.append(delta_rig[:2])
 
+        if len(rig_points) < 2:
+            return None
         return np.array(rig_points)
 
     # ==================================================================
@@ -600,6 +621,19 @@ class CarlaObserver:
                         self.inference_count += 1
                         self.inference_busy = False
 
+                        # ── Snapshot frozen comparison ──
+                        # Actual path from submit_tick → now, in submit rig frame
+                        self._frozen_actual_rig = (
+                            self._build_actual_path_from_submit(result.submit_tick)
+                        )
+                        self._frozen_traj_xy = result.output.trajectory_xy
+                        self._frozen_all_traj = result.output.all_trajectories_xy
+                        self._frozen_sel_idx = result.output.selected_index
+                        self._frozen_reasoning = result.output.reasoning
+                        self._frozen_delay_ticks = (
+                            self.tick_count - result.submit_tick
+                        )
+
                 # --- Submit new inference if idle and data ready ---
                 if not self.inference_busy:
                     cam_frames = self._prepare_camera_frames()
@@ -618,38 +652,24 @@ class CarlaObserver:
                 # --- Update spectator ---
                 self._update_spectator()
 
-                # --- Display ---
+                # --- Display (always show frozen snapshot) ---
                 if self.display is not None:
                     state = self.get_vehicle_state()
-                    output = self.last_output
-
-                    # Delay in ticks since the input was captured
-                    delay_ticks = (
-                        self.tick_count - self.last_result_tick
-                        if self.last_result_tick > 0 else -1
-                    )
-
-                    traj_xy = output.trajectory_xy if output else None
-                    reasoning = output.reasoning if output else None
-                    all_traj = output.all_trajectories_xy if output else None
-                    sel_idx = output.selected_index if output else 0
-
-                    actual_rig = self._actual_path_in_rig()
 
                     self.display.tick(
                         camera_images=self._get_latest_camera_images(),
                         vehicle_state=state,
-                        trajectory_xy=traj_xy,
-                        reasoning=reasoning,
+                        trajectory_xy=self._frozen_traj_xy,
+                        reasoning=self._frozen_reasoning,
                         inference_count=self.inference_count,
                         tick_count=self.tick_count,
                         inference_time=self.last_inference_time,
-                        all_trajectories_xy=all_traj,
-                        selected_traj_index=sel_idx,
+                        all_trajectories_xy=self._frozen_all_traj,
+                        selected_traj_index=self._frozen_sel_idx,
                         # Observer-specific extras
                         observer_mode=True,
-                        delay_ticks=delay_ticks,
-                        actual_path_rig=actual_rig,
+                        delay_ticks=self._frozen_delay_ticks,
+                        actual_path_rig=self._frozen_actual_rig,
                         autopilot_state=state,
                     )
                     if self.display.should_quit:
