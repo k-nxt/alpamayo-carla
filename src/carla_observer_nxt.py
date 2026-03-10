@@ -71,6 +71,10 @@ class ObserverConfig:
     # TrafficManager's vehicle_percentage_speed_difference semantics:
     #   0 → limit speed, -20 → 20% above limit, 30 → 30% below limit.
 
+    # NPC traffic
+    num_npc_vehicles: int = 0     # number of NPC vehicles to spawn
+    num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
+
     # Alpamayo model
     model_name: str = "nvidia/Alpamayo-R1-10B"
     use_dummy_model: bool = False
@@ -201,6 +205,11 @@ class CarlaObserver:
         self.spectator: Optional[carla.Actor] = None
         self.traffic_manager: Optional[carla.TrafficManager] = None
 
+        # NPC actors (cleaned up on exit)
+        self._npc_vehicles: list = []
+        self._npc_walkers: list = []       # walker actors
+        self._npc_walker_ctrls: list = []  # AI controller actors
+
         # Sub-components
         self.sensor_manager: Optional[SensorManager] = None
         self.alpamayo: Optional[AlpamayoWrapper] = None
@@ -329,6 +338,131 @@ class CarlaObserver:
 
         print(f"Autopilot enabled (speed offset: {self.config.autopilot_speed_pct}%)")
 
+    def _spawn_npc_traffic(self) -> None:
+        """Spawn NPC vehicles and pedestrians with autopilot / AI control."""
+        import random
+
+        cfg = self.config
+        tm_port = 8000
+
+        # ── NPC vehicles ──
+        if cfg.num_npc_vehicles > 0:
+            bp_lib = self.world.get_blueprint_library()
+            vehicle_bps = bp_lib.filter("vehicle.*")
+            # Exclude bicycles / motorcycles for stability
+            vehicle_bps = [
+                bp for bp in vehicle_bps
+                if int(bp.get_attribute("number_of_wheels")) >= 4
+            ]
+
+            spawns = self.world.get_map().get_spawn_points()
+            random.shuffle(spawns)
+
+            count = 0
+            for sp in spawns[:cfg.num_npc_vehicles + 10]:
+                if count >= cfg.num_npc_vehicles:
+                    break
+                bp = random.choice(vehicle_bps)
+                # Randomise color
+                if bp.has_attribute("color"):
+                    colors = bp.get_attribute("color").recommended_values
+                    bp.set_attribute("color", random.choice(colors))
+                bp.set_attribute("role_name", "npc")
+                try:
+                    npc = self.world.spawn_actor(bp, sp)
+                    npc.set_autopilot(True, tm_port)
+                    self._npc_vehicles.append(npc)
+                    count += 1
+                except RuntimeError:
+                    continue
+
+            print(f"Spawned {count} NPC vehicles")
+
+        # ── NPC pedestrians (walkers) ──
+        if cfg.num_npc_walkers > 0:
+            bp_lib = self.world.get_blueprint_library()
+            walker_bps = bp_lib.filter("walker.pedestrian.*")
+
+            # Use SpawnActor batch for walkers
+            spawn_points = []
+            for _ in range(cfg.num_npc_walkers + 20):
+                loc = self.world.get_random_location_from_navigation()
+                if loc is not None:
+                    spawn_points.append(
+                        carla.Transform(location=loc)
+                    )
+
+            count = 0
+            for sp in spawn_points[:cfg.num_npc_walkers + 10]:
+                if count >= cfg.num_npc_walkers:
+                    break
+                bp = random.choice(walker_bps)
+                if bp.has_attribute("is_invincible"):
+                    bp.set_attribute("is_invincible", "false")
+                try:
+                    walker = self.world.spawn_actor(bp, sp)
+                    self._npc_walkers.append(walker)
+                    count += 1
+                except RuntimeError:
+                    continue
+
+            # Spawn AI controllers for each walker
+            ctrl_bp = self.world.get_blueprint_library().find(
+                "controller.ai.walker"
+            )
+            for walker in self._npc_walkers:
+                try:
+                    ctrl = self.world.spawn_actor(ctrl_bp, carla.Transform(), walker)
+                    self._npc_walker_ctrls.append(ctrl)
+                except RuntimeError:
+                    self._npc_walker_ctrls.append(None)
+
+            # Need one tick for controllers to initialise
+            self.world.tick()
+
+            # Start walking to random destinations
+            for ctrl in self._npc_walker_ctrls:
+                if ctrl is None:
+                    continue
+                ctrl.start()
+                dest = self.world.get_random_location_from_navigation()
+                if dest is not None:
+                    ctrl.go_to_location(dest)
+                ctrl.set_max_speed(1.0 + random.random() * 1.5)  # 1.0–2.5 m/s
+
+            print(f"Spawned {count} NPC walkers")
+
+    def _destroy_npc_traffic(self) -> None:
+        """Destroy all NPC actors (tolerant of already-dead actors)."""
+        # Stop walker controllers first
+        for ctrl in self._npc_walker_ctrls:
+            try:
+                if ctrl is not None and ctrl.is_alive:
+                    ctrl.stop()
+                    ctrl.destroy()
+            except RuntimeError:
+                pass
+        self._npc_walker_ctrls.clear()
+
+        for walker in self._npc_walkers:
+            try:
+                if walker is not None and walker.is_alive:
+                    walker.destroy()
+            except RuntimeError:
+                pass
+        self._npc_walkers.clear()
+
+        for npc in self._npc_vehicles:
+            try:
+                if npc is not None and npc.is_alive:
+                    npc.set_autopilot(False)
+                    npc.destroy()
+            except RuntimeError:
+                pass
+        self._npc_vehicles.clear()
+
+        print("Destroyed NPC traffic")
+
     @staticmethod
     def _parse_cam_resolution(value: str) -> Optional[tuple]:
         if value == "full":
@@ -387,6 +521,10 @@ class CarlaObserver:
 
         # Enable autopilot AFTER synchronous mode is set
         self._enable_autopilot()
+
+        # Spawn NPC traffic
+        if self.config.num_npc_vehicles > 0 or self.config.num_npc_walkers > 0:
+            self._spawn_npc_traffic()
 
         # Start inference worker thread
         self._worker_thread = threading.Thread(
@@ -606,7 +744,12 @@ class CarlaObserver:
 
         try:
             for tick in range(max_ticks):
-                self.world.tick()
+                try:
+                    self.world.tick()
+                except RuntimeError as e:
+                    print(f"\nCARLA tick error: {e}")
+                    print("Server may have disconnected — stopping.")
+                    break
                 self._record_ego_pose()
                 self.tick_count += 1
 
@@ -734,16 +877,27 @@ class CarlaObserver:
             self.display = None
         if self.sensor_manager:
             self.sensor_manager.destroy_all()
-        if self.vehicle and self.vehicle.is_alive:
-            self.vehicle.set_autopilot(False)
-            self.vehicle.destroy()
-            print("Destroyed vehicle")
-        if self.world:
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            self.world.apply_settings(settings)
-        if self.traffic_manager:
-            self.traffic_manager.set_synchronous_mode(False)
+        # Destroy NPC traffic before ego vehicle
+        self._destroy_npc_traffic()
+        try:
+            if self.vehicle and self.vehicle.is_alive:
+                self.vehicle.set_autopilot(False)
+                self.vehicle.destroy()
+                print("Destroyed vehicle")
+        except RuntimeError:
+            pass
+        try:
+            if self.world:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = False
+                self.world.apply_settings(settings)
+        except RuntimeError:
+            pass
+        try:
+            if self.traffic_manager:
+                self.traffic_manager.set_synchronous_mode(False)
+        except RuntimeError:
+            pass
         print("Cleanup complete")
 
     def __enter__(self):

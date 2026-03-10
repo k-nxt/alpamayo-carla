@@ -71,6 +71,16 @@ def main():
              "(negative = faster, positive = slower; default -20)",
     )
 
+    # NPC traffic
+    parser.add_argument(
+        "--npc-vehicles", type=int, default=0, metavar="N",
+        help="Number of NPC vehicles to spawn (default 0)",
+    )
+    parser.add_argument(
+        "--npc-walkers", type=int, default=0, metavar="N",
+        help="Number of NPC pedestrians to spawn (default 0)",
+    )
+
     # Alpamayo inference parameters
     parser.add_argument(
         "--max-gen-len", type=int, default=64,
@@ -130,6 +140,8 @@ def main():
         use_dummy_model=args.dummy,
         model_name=args.model,
         autopilot_speed_pct=args.autopilot_speed,
+        num_npc_vehicles=args.npc_vehicles,
+        num_npc_walkers=args.npc_walkers,
         num_traj_samples=args.num_traj_samples,
         max_generation_length=args.max_gen_len,
         diffusion_steps=args.diffusion_steps,
