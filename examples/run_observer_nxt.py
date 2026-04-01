@@ -2,23 +2,24 @@
 """
 Run CARLA Alpamayo Observer (NXT) — Open-Loop Evaluation Mode
 
-The CARLA autopilot drives the vehicle while Alpamayo-R1 observes and
+The CARLA autopilot drives the vehicle while Alpamayo observes and
 produces trajectory predictions and chain-of-thought reasoning.  The
 model output is displayed alongside the actual driving but is NEVER
 used for vehicle control.
 
+Supports both Alpamayo R1 and Alpamayo 1.5.
+
 Usage:
-    # Activate the venv
+    # Alpamayo R1 (default)
     source /work/yasu/program/alpamayo/alpamayo/ar1_venv/bin/activate
+    python run_observer_nxt.py --ticks 3000 --map Town03
+
+    # Alpamayo 1.5 (with navigation)
+    source /work/yasu/program/alpamayo/alpamayo1.5/a1_5_venv/bin/activate
+    python run_observer_nxt.py --model nvidia/Alpamayo-1.5-10B --ticks 3000
 
     # Dummy mode (no GPU, for testing)
     python run_observer_nxt.py --dummy --ticks 500
-
-    # Full model
-    python run_observer_nxt.py --ticks 3000 --map Town03
-
-    # With recording
-    python run_observer_nxt.py --ticks 3000 --map Town01 --record obs01.mp4
 """
 
 import argparse
@@ -62,8 +63,8 @@ def main():
         help="Vehicle blueprint filter",
     )
     parser.add_argument(
-        "--model", default="nvidia/Alpamayo-R1-10B",
-        help="HuggingFace model ID or local path",
+        "--model", default="nvidia/Alpamayo-1.5-10B",
+        help="HuggingFace model ID or local path (e.g. nvidia/Alpamayo-R1-10B for R1)",
     )
     parser.add_argument(
         "--autopilot-speed", type=float, default=-20.0,
@@ -79,6 +80,20 @@ def main():
     parser.add_argument(
         "--npc-walkers", type=int, default=0, metavar="N",
         help="Number of NPC pedestrians to spawn (default 0)",
+    )
+
+    # ── Navigation (Alpamayo 1.5) ──
+    parser.add_argument(
+        "--no-nav", action="store_true",
+        help="Disable navigation instructions (Alpamayo 1.5 only; ignored for R1)",
+    )
+    parser.add_argument(
+        "--cfg-nav", action="store_true",
+        help="Use classifier-free guidance for navigation conditioning (1.5 only)",
+    )
+    parser.add_argument(
+        "--cfg-nav-weight", type=float, default=None, metavar="ALPHA",
+        help="CFG guidance weight for navigation (1.5 only; None = model default)",
     )
 
     # Alpamayo inference parameters
@@ -142,6 +157,9 @@ def main():
         autopilot_speed_pct=args.autopilot_speed,
         num_npc_vehicles=args.npc_vehicles,
         num_npc_walkers=args.npc_walkers,
+        nav_enabled=not args.no_nav,
+        use_cfg_nav=args.cfg_nav,
+        cfg_nav_guidance_weight=args.cfg_nav_weight,
         num_traj_samples=args.num_traj_samples,
         max_generation_length=args.max_gen_len,
         diffusion_steps=args.diffusion_steps,

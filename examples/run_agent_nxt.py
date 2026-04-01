@@ -2,15 +2,20 @@
 """
 Run CARLA Alpamayo Agent (NXT)
 
+Supports both Alpamayo R1 and Alpamayo 1.5.  The model version is
+auto-detected from the --model argument.
+
 Usage:
-    # Activate the venv that has alpamayo_r1, transformers, carla
+    # Alpamayo R1 (default)
     source /work/yasu/program/alpamayo/alpamayo/ar1_venv/bin/activate
+    python run_agent_nxt.py --frames 500
+
+    # Alpamayo 1.5 (with navigation)
+    source /work/yasu/program/alpamayo/alpamayo1.5/a1_5_venv/bin/activate
+    python run_agent_nxt.py --model nvidia/Alpamayo-1.5-10B --frames 500
 
     # Dummy mode (no GPU, for testing CARLA integration)
     python run_agent_nxt.py --dummy --frames 200
-
-    # Full model
-    python run_agent_nxt.py --frames 500
 """
 
 import argparse
@@ -52,8 +57,8 @@ def main():
         help="Vehicle blueprint filter (e.g. vehicle.mercedes.coupe_2020, vehicle.lincoln.mkz_2020)",
     )
     parser.add_argument(
-        "--model", default="nvidia/Alpamayo-R1-10B",
-        help="HuggingFace model ID or local path",
+        "--model", default="nvidia/Alpamayo-1.5-10B",
+        help="HuggingFace model ID or local path (e.g. nvidia/Alpamayo-R1-10B for R1)",
     )
     parser.add_argument(
         "--max-speed", type=float, default=30.0,
@@ -70,6 +75,11 @@ def main():
         "--steer-gain", type=float, default=1.0,
         help="Steering gain multiplier (default 1.0; >1 = sharper turns). "
              "Useful when the car cannot make curves at higher min-speed.",
+    )
+    parser.add_argument(
+        "--steer-norm-deg", type=float, default=70.0,
+        help="Steering normalization angle in degrees (default 70). "
+             "Lower values increase steering sensitivity.",
     )
     parser.add_argument(
         "--max-gen-len", type=int, default=64,
@@ -114,6 +124,24 @@ def main():
     parser.add_argument(
         "--crf", type=int, default=23,
         help="H.264 CRF for recording (0=lossless, 23=default, 51=worst)",
+    )
+
+    # ── Navigation (Alpamayo 1.5) ──
+    parser.add_argument(
+        "--no-nav", action="store_true",
+        help="Disable navigation instructions (Alpamayo 1.5 only; ignored for R1)",
+    )
+    parser.add_argument(
+        "--cfg-nav", action="store_true",
+        help="Use classifier-free guidance for navigation conditioning (1.5 only)",
+    )
+    parser.add_argument(
+        "--cfg-nav-weight", type=float, default=None, metavar="ALPHA",
+        help="CFG guidance weight for navigation (1.5 only; None = model default)",
+    )
+    parser.add_argument(
+        "--nav-dest", type=int, default=-1, metavar="IDX",
+        help="Spawn-point index for route destination (-1 = random, auto-replan on arrival)",
     )
 
     # ── Trajectory optimizer ──
@@ -164,6 +192,7 @@ def main():
         max_speed_kmh=args.max_speed,
         min_speed_kmh=args.min_speed,
         steer_gain=args.steer_gain,
+        steer_normalize_deg=args.steer_norm_deg,
         num_traj_samples=args.num_traj_samples,
         max_generation_length=args.max_gen_len,
         diffusion_steps=args.diffusion_steps,
@@ -175,6 +204,10 @@ def main():
         enable_display=not args.no_display,
         record_path=args.record,
         record_crf=args.crf,
+        nav_enabled=not args.no_nav,
+        use_cfg_nav=args.cfg_nav,
+        cfg_nav_guidance_weight=args.cfg_nav_weight,
+        nav_destination_index=args.nav_dest,
         traj_opt_enabled=args.traj_opt,
         traj_opt_smoothness_w=args.traj_opt_smooth,
         traj_opt_deviation_w=args.traj_opt_deviation,

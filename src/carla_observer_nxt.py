@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from collections import deque
 from scipy.spatial.transform import Rotation
 
-from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
+from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput, detect_model_version, VERSION_15
 from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
 from .display_nxt import Display
 
@@ -76,7 +76,7 @@ class ObserverConfig:
     num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
 
     # Alpamayo model
-    model_name: str = "nvidia/Alpamayo-R1-10B"
+    model_name: str = "nvidia/Alpamayo-1.5-10B"
     use_dummy_model: bool = False
     context_length: int = 4
     num_traj_samples: int = 6
@@ -85,6 +85,11 @@ class ObserverConfig:
     cam_resolution: str = "full"
     vlm_temperature: float = 0.6
     vlm_top_p: float = 0.98
+
+    # Navigation (Alpamayo 1.5)
+    nav_enabled: bool = True              # enable nav instructions (auto-disabled for R1)
+    use_cfg_nav: bool = False             # use classifier-free guidance for nav
+    cfg_nav_guidance_weight: Optional[float] = None
 
     # Simulation
     sim_fps: float = 10.0
@@ -105,6 +110,7 @@ class _InferenceRequest:
     ego_history_xyz: torch.Tensor     # (1,1,16,3)
     ego_history_rot: torch.Tensor     # (1,1,16,3,3)
     submit_tick: int                  # simulation tick when this was captured
+    nav_text: Optional[str] = None    # navigation instruction (1.5 only)
 
 
 @dataclass
@@ -113,6 +119,7 @@ class _InferenceResult:
     output: AlpamayoOutput
     submit_tick: int                  # tick when input was captured
     inference_time: float             # wall-clock seconds
+    nav_text: Optional[str] = None
 
 
 def _inference_worker(
@@ -150,6 +157,9 @@ def _inference_worker(
                 ego_history_rot=req.ego_history_rot,
                 max_generation_length=config.max_generation_length,
                 diffusion_steps=config.diffusion_steps,
+                nav_text=req.nav_text,
+                use_cfg_nav=config.use_cfg_nav,
+                cfg_nav_guidance_weight=config.cfg_nav_guidance_weight,
             )
         elapsed = time.perf_counter() - t0
 
@@ -157,6 +167,7 @@ def _inference_worker(
             output=output,
             submit_tick=req.submit_tick,
             inference_time=elapsed,
+            nav_text=req.nav_text,
         )
         result_event.set()
 
@@ -214,6 +225,7 @@ class CarlaObserver:
         self.sensor_manager: Optional[SensorManager] = None
         self.alpamayo: Optional[AlpamayoWrapper] = None
         self.display: Optional[Display] = None
+        self.nav_planner = None  # NavPlanner (Alpamayo 1.5 only)
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -231,12 +243,15 @@ class CarlaObserver:
         self.last_result_tick: int = 0          # tick when the last result input was captured
         self.inference_busy: bool = False
 
+        self.last_nav_text: Optional[str] = None
+
         # Frozen comparison snapshot (updated only when inference completes)
         self._frozen_actual_rig: Optional[np.ndarray] = None   # (N,2) actual path in rig
         self._frozen_traj_xy: Optional[np.ndarray] = None       # (T,2) selected traj
         self._frozen_all_traj: Optional[np.ndarray] = None      # (N,T,2) all candidates
         self._frozen_sel_idx: int = 0
         self._frozen_reasoning: Optional[str] = None
+        self._frozen_meta_action: Optional[str] = None
         self._frozen_delay_ticks: int = -1
 
         # Threading
@@ -526,6 +541,22 @@ class CarlaObserver:
         if self.config.num_npc_vehicles > 0 or self.config.num_npc_walkers > 0:
             self._spawn_npc_traffic()
 
+        # Navigation planner (Alpamayo 1.5 only)
+        if (
+            self.config.nav_enabled
+            and detect_model_version(self.config.model_name) == VERSION_15
+        ):
+            try:
+                from .nav_planner_nxt import NavPlanner
+                self.nav_planner = NavPlanner(self.world)
+                start = self.vehicle.get_location()
+                self.nav_planner.set_random_destination(start)
+                print("Navigation planner enabled (Alpamayo 1.5)")
+            except ImportError as e:
+                print(f"Warning: NavPlanner unavailable ({e}). "
+                      "Navigation instructions will be disabled.")
+                self.nav_planner = None
+
         # Start inference worker thread
         self._worker_thread = threading.Thread(
             target=_inference_worker,
@@ -761,6 +792,7 @@ class CarlaObserver:
                         self.last_output = result.output
                         self.last_inference_time = result.inference_time
                         self.last_result_tick = result.submit_tick
+                        self.last_nav_text = result.nav_text
                         self.inference_count += 1
                         self.inference_busy = False
 
@@ -773,6 +805,7 @@ class CarlaObserver:
                         self._frozen_all_traj = result.output.all_trajectories_xy
                         self._frozen_sel_idx = result.output.selected_index
                         self._frozen_reasoning = result.output.reasoning
+                        self._frozen_meta_action = result.output.meta_action
                         self._frozen_delay_ticks = (
                             self.tick_count - result.submit_tick
                         )
@@ -783,11 +816,21 @@ class CarlaObserver:
                     hist = self._build_ego_history_tensors()
                     if cam_frames is not None and hist is not None:
                         ego_xyz, ego_rot = hist
+                        nav_text = None
+                        if self.nav_planner is not None:
+                            nav_text = self.nav_planner.get_instruction(
+                                self.vehicle.get_transform()
+                            )
+                            if self.nav_planner.route_complete:
+                                self.nav_planner.set_random_destination(
+                                    self.vehicle.get_location()
+                                )
                         self._shared["request"] = _InferenceRequest(
                             camera_frames=cam_frames,
                             ego_history_xyz=ego_xyz,
                             ego_history_rot=ego_rot,
                             submit_tick=self.tick_count,
+                            nav_text=nav_text,
                         )
                         self._request_event.set()
                         self.inference_busy = True
@@ -809,11 +852,12 @@ class CarlaObserver:
                         inference_time=self.last_inference_time,
                         all_trajectories_xy=self._frozen_all_traj,
                         selected_traj_index=self._frozen_sel_idx,
-                        # Observer-specific extras
                         observer_mode=True,
                         delay_ticks=self._frozen_delay_ticks,
                         actual_path_rig=self._frozen_actual_rig,
                         autopilot_state=state,
+                        nav_text=self.last_nav_text,
+                        meta_action=self._frozen_meta_action,
                     )
                     if self.display.should_quit:
                         print("Display closed — stopping.")

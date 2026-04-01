@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from collections import deque
 from scipy.spatial.transform import Rotation
 
-from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput
+from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput, detect_model_version, VERSION_15
 from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
 from .display_nxt import Display
 from .trajectory_optimizer_nxt import (
@@ -67,7 +67,7 @@ class AgentConfig:
     spawn_point_index: int = -1   # -1 = random
 
     # Alpamayo model
-    model_name: str = "nvidia/Alpamayo-R1-10B"
+    model_name: str = "nvidia/Alpamayo-1.5-10B"
     use_dummy_model: bool = False
     context_length: int = 4       # temporal image frames
     num_traj_samples: int = 6
@@ -86,6 +86,7 @@ class AgentConfig:
     min_speed_kmh: float = 0.0        # 0 = no minimum; >0 = floor for desired speed
     lookahead_distance: float = 5.0   # pure-pursuit look-ahead (m)
     steer_gain: float = 1.0           # steering multiplier (>1 = sharper turns)
+    steer_normalize_deg: float = 70.0 # steering normalisation angle (deg)
 
     # Display
     enable_display: bool = True       # pygame dashboard window
@@ -93,6 +94,12 @@ class AgentConfig:
     # Video recording
     record_path: Optional[str] = None  # MP4 output path (None = no recording)
     record_crf: int = 23              # H.264 CRF (0=lossless, 23=default, 51=worst)
+
+    # Navigation (Alpamayo 1.5)
+    nav_enabled: bool = True              # enable nav instructions (auto-disabled for R1)
+    use_cfg_nav: bool = False             # use classifier-free guidance for nav
+    cfg_nav_guidance_weight: Optional[float] = None  # CFG alpha (None = model default)
+    nav_destination_index: int = -1       # spawn-point index for route destination (-1 = random)
 
     # Trajectory optimiser (post-processing for smoothness / comfort)
     traj_opt_enabled: bool = False          # enable trajectory optimisation
@@ -151,6 +158,7 @@ class TrajectoryFollower:
         max_speed_kmh: float = 30.0,
         min_speed_kmh: float = 0.0,
         steer_gain: float = 1.0,
+        steer_normalize_deg: float = 70.0,
         wheelbase: float = 2.875,          # Mercedes coupe approx
         output_frequency_hz: float = 10.0,  # Alpamayo outputs at 10 Hz
     ):
@@ -158,6 +166,9 @@ class TrajectoryFollower:
         self.max_speed_ms = max_speed_kmh / 3.6
         self.min_speed_ms = min_speed_kmh / 3.6
         self.steer_gain = steer_gain
+        if steer_normalize_deg <= 0.0:
+            raise ValueError("steer_normalize_deg must be > 0")
+        self._steer_norm_rad = np.radians(steer_normalize_deg)
         self.wheelbase = wheelbase
         self.dt = 1.0 / output_frequency_hz
 
@@ -229,7 +240,7 @@ class TrajectoryFollower:
         else:
             curvature = 2.0 * dy / (dist ** 2)
             steer_rad = np.arctan(curvature * self.wheelbase)
-            pp_steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
+            pp_steer = float(np.clip(steer_rad / self._steer_norm_rad, -1.0, 1.0))
             # Rig Y-left positive → CARLA steer-right positive ⇒ flip
             pp_steer = -pp_steer
 
@@ -591,7 +602,7 @@ class TrajectoryFollower:
         kappa = 2.0 * sin_th / look_d
 
         steer_rad = np.arctan(kappa * self.wheelbase)
-        hdg_steer = float(np.clip(steer_rad / np.radians(70), -1.0, 1.0))
+        hdg_steer = float(np.clip(steer_rad / self._steer_norm_rad, -1.0, 1.0))
 
         # Flip: rig Y-left positive → CARLA steer-right positive
         hdg_steer = -hdg_steer
@@ -627,6 +638,7 @@ class CarlaAlpamayoAgent:
         self.follower: Optional[TrajectoryFollower] = None
         self.display: Optional[Display] = None
         self.traj_optimizer: Optional[TrajectoryOptimizer] = None
+        self.nav_planner = None  # NavPlanner (Alpamayo 1.5 only)
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -638,6 +650,7 @@ class CarlaAlpamayoAgent:
         self.last_output: Optional[AlpamayoOutput] = None
         self.last_inference_time: float = 0.0  # seconds (wall clock)
         self.last_opt_result: Optional[OptimizationResult] = None
+        self.last_nav_text: Optional[str] = None
 
     # ==================================================================
     # Initialisation helpers
@@ -801,6 +814,7 @@ class CarlaAlpamayoAgent:
             max_speed_kmh=self.config.max_speed_kmh,
             min_speed_kmh=self.config.min_speed_kmh,
             steer_gain=self.config.steer_gain,
+            steer_normalize_deg=self.config.steer_normalize_deg,
         )
 
         # Trajectory optimiser (optional post-processing)
@@ -826,6 +840,29 @@ class CarlaAlpamayoAgent:
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.config.sim_fps
         self.world.apply_settings(settings)
+
+        # Navigation planner (Alpamayo 1.5 only)
+        if (
+            self.config.nav_enabled
+            and detect_model_version(self.config.model_name) == VERSION_15
+        ):
+            try:
+                from .nav_planner_nxt import NavPlanner
+                self.nav_planner = NavPlanner(self.world)
+                # Plan initial route
+                start = self.vehicle.get_location()
+                if self.config.nav_destination_index >= 0:
+                    spawns = self.world.get_map().get_spawn_points()
+                    idx = min(self.config.nav_destination_index, len(spawns) - 1)
+                    self.nav_planner.set_route(start, spawns[idx].location)
+                    print(f"NavPlanner: route to spawn point {idx}")
+                else:
+                    self.nav_planner.set_random_destination(start)
+                print("Navigation planner enabled (Alpamayo 1.5)")
+            except ImportError as e:
+                print(f"Warning: NavPlanner unavailable ({e}). "
+                      "Navigation instructions will be disabled.")
+                self.nav_planner = None
 
         # Pygame display (optional)
         if self.config.enable_display:
@@ -989,6 +1026,17 @@ class CarlaAlpamayoAgent:
     # Step / run loop
     # ==================================================================
 
+    def _get_nav_text(self) -> Optional[str]:
+        """Get the current navigation instruction from the planner."""
+        if self.nav_planner is None:
+            return None
+        nav_text = self.nav_planner.get_instruction(self.vehicle.get_transform())
+        # Auto-replan when route is complete
+        if self.nav_planner.route_complete:
+            start = self.vehicle.get_location()
+            self.nav_planner.set_random_destination(start)
+        return nav_text
+
     def step(self) -> Optional[AlpamayoOutput]:
         """Execute one simulation tick; optionally run inference."""
         self._record_ego_pose()
@@ -1003,6 +1051,10 @@ class CarlaAlpamayoAgent:
             if cam_frames is not None and hist is not None:
                 ego_xyz, ego_rot = hist
 
+                # Navigation instruction (Alpamayo 1.5 only)
+                nav_text = self._get_nav_text()
+                self.last_nav_text = nav_text
+
                 t0 = time.perf_counter()
                 if self.config.use_dummy_model:
                     output = self.alpamayo.predict_dummy()
@@ -1013,6 +1065,9 @@ class CarlaAlpamayoAgent:
                         ego_history_rot=ego_rot,
                         max_generation_length=self.config.max_generation_length,
                         diffusion_steps=self.config.diffusion_steps,
+                        nav_text=nav_text,
+                        use_cfg_nav=self.config.use_cfg_nav,
+                        cfg_nav_guidance_weight=self.config.cfg_nav_guidance_weight,
                     )
                 self.last_inference_time = time.perf_counter() - t0
 
@@ -1119,6 +1174,7 @@ class CarlaAlpamayoAgent:
                     # Raw model output for comparison
                     raw_traj = output.trajectory_xy if output else None
                     reasoning = output.reasoning if output else None
+                    meta_act = output.meta_action if output else None
                     all_traj = output.all_trajectories_xy if output else None
                     sel_idx = output.selected_index if output else 0
                     self.display.tick(
@@ -1132,6 +1188,8 @@ class CarlaAlpamayoAgent:
                         all_trajectories_xy=all_traj,
                         selected_traj_index=sel_idx,
                         raw_trajectory_xy=raw_traj if self.traj_optimizer else None,
+                        nav_text=self.last_nav_text,
+                        meta_action=meta_act,
                     )
                     if self.display.should_quit:
                         print("Display closed – stopping.")
@@ -1149,8 +1207,10 @@ class CarlaAlpamayoAgent:
                     ds = self.follower._last_desired_speed      # EMA smoothed
                     ds_raw = self.follower._raw_desired_speed    # instant (before EMA)
                     cot = ""
+                    if output and output.meta_action:
+                        cot = f"[{output.meta_action.strip()[:30]}] "
                     if output and output.reasoning:
-                        cot = output.reasoning[:60].replace("\n", " ") + "…"
+                        cot += output.reasoning[:50].replace("\n", " ") + "…"
                     opt_tag = ""
                     if self.last_opt_result is not None:
                         r = self.last_opt_result
@@ -1177,12 +1237,15 @@ class CarlaAlpamayoAgent:
                     curv_tag = f" curv:{curv_spd:.1f}m/s" if curv_spd < 90 else ""
                     hw = self.follower._hdg_weight
                     hdg_tag = f" hdg:{hw:.0%}" if hw > 0.05 else ""
+                    nav_tag = ""
+                    if self.last_nav_text:
+                        nav_tag = f" Nav:[{self.last_nav_text}]"
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
                         f"({self.last_inference_time:.2f}s) | "
                         f"Spd {st['speed_kmh']:5.1f} | "
                         f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} Str {steer_ema:+.2f} | "
-                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{vote_tag}{curv_tag}{hdg_tag}{opt_tag}{nudge_tag} | {cot}"
+                        f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{vote_tag}{curv_tag}{hdg_tag}{opt_tag}{nudge_tag}{nav_tag} | {cot}"
                     )
                 tick += 1
 

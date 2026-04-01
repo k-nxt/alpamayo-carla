@@ -104,7 +104,7 @@ class Display:
             )
 
         pygame.init()
-        pygame.display.set_caption("Alpamayo-R1  –  CARLA")
+        pygame.display.set_caption("Alpamayo  –  CARLA")
         self.width = width
         self.height = height
         self.screen = pygame.display.set_mode((width, height))
@@ -116,6 +116,7 @@ class Display:
 
         self.should_quit = False
         self._frame_times: List[float] = []
+        self._sim_fps = max(float(record_fps), 1e-6)
 
         # ── Video recording ──
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
@@ -172,6 +173,9 @@ class Display:
         delay_ticks: int = -1,
         actual_path_rig: Optional[np.ndarray] = None,
         autopilot_state: Optional[Dict] = None,
+        # ── Navigation & meta-action ──
+        nav_text: Optional[str] = None,
+        meta_action: Optional[str] = None,
     ) -> None:
         """
         Redraw one frame of the dashboard.
@@ -214,6 +218,7 @@ class Display:
             observer_mode=observer_mode,
             delay_ticks=delay_ticks,
             autopilot_state=autopilot_state,
+            nav_text=nav_text,
         )
 
         # ── BEV trajectory + reasoning (bottom-right) ──
@@ -223,7 +228,7 @@ class Display:
             actual_path_rig=actual_path_rig,
             observer_mode=observer_mode,
         )
-        self._draw_reasoning(reasoning)
+        self._draw_reasoning(reasoning, meta_action=meta_action)
 
         pygame.display.flip()
 
@@ -325,6 +330,7 @@ class Display:
         observer_mode: bool = False,
         delay_ticks: int = -1,
         autopilot_state: Optional[Dict] = None,
+        nav_text: Optional[str] = None,
     ) -> None:
         x, y = 0, _BOTTOM_Y
         w, h = _HUD_W, _BOTTOM_H
@@ -334,6 +340,12 @@ class Display:
 
         speed = state["speed_kmh"] if state else 0.0
         lines.append((f"Speed    {speed:6.1f} km/h", _TEXT))
+
+        # Navigation instruction — shown prominently right after speed
+        if nav_text:
+            _NAV_COLOR = (100, 220, 255)
+            lines.append((f">> {nav_text}", _NAV_COLOR))
+
         lines.append((f"Tick     {tick:6d}", _TEXT))
         lines.append((f"Infer #  {inf_count:6d}", _ACCENT))
 
@@ -364,10 +376,10 @@ class Display:
 
             # Delay info
             if delay_ticks >= 0:
-                delay_s = delay_ticks * 0.1  # assuming 10 Hz
+                delay_s = delay_ticks / self._sim_fps
                 delay_color = (
-                    _GREEN if delay_ticks <= 20
-                    else ((255, 200, 50) if delay_ticks <= 50 else (255, 80, 80))
+                    _GREEN if delay_s <= 2.0
+                    else ((255, 200, 50) if delay_s <= 5.0 else (255, 80, 80))
                 )
                 lines.append((
                     f"Delay    {delay_ticks:4d} tick ({delay_s:.1f}s)",
@@ -541,27 +553,59 @@ class Display:
 
     # -- Reasoning text --------------------------------------------
 
-    def _draw_reasoning(self, reasoning: Optional[str]) -> None:
+    def _draw_reasoning(
+        self,
+        reasoning: Optional[str],
+        meta_action: Optional[str] = None,
+    ) -> None:
         rx = _HUD_W
         ry = _BOTTOM_Y + _BOTTOM_H // 2
         rw = _BEV_W
         rh = _BOTTOM_H // 2
         pygame.draw.rect(self.screen, _PANEL_BG, (rx, ry, rw, rh))
 
+        ty = ry + 8
+
+        # ── Meta-action (compact, at the top of the panel) ──
+        _META_COLOR = (255, 210, 80)
+        if meta_action:
+            title_ma = self.font.render("Meta-Action", True, _META_COLOR)
+            self.screen.blit(title_ma, (rx + 12, ty))
+            ty += 24
+            ma_lines = self._word_wrap(meta_action, rw)
+            for line in ma_lines[:3]:
+                surf = self.font_sm.render(line, True, _META_COLOR)
+                self.screen.blit(surf, (rx + 16, ty))
+                ty += 20
+            ty += 4
+        else:
+            ty += 4
+
+        # ── Chain of Thought ──
         title = self.font.render("Chain of Thought", True, _ACCENT)
-        self.screen.blit(title, (rx + 12, ry + 8))
+        self.screen.blit(title, (rx + 12, ty))
+        ty += 26
 
         if not reasoning:
             placeholder = self.font_xs.render(
                 "(waiting for inference…)", True, _TEXT_DIM
             )
-            self.screen.blit(placeholder, (rx + 16, ry + 38))
+            self.screen.blit(placeholder, (rx + 16, ty))
             return
 
-        # Word-wrap the reasoning text into the panel
-        max_chars = (rw - 32) // 8  # approx chars per line at font_xs
-        lines = []
-        for paragraph in reasoning.split("\n"):
+        lines = self._word_wrap(reasoning, rw)
+        remaining_h = (ry + rh) - ty - 8
+        max_lines = max(1, remaining_h // 16)
+        for line in lines[:max_lines]:
+            surf = self.font_xs.render(line, True, _TEXT)
+            self.screen.blit(surf, (rx + 16, ty))
+            ty += 16
+
+    def _word_wrap(self, text: str, panel_width: int) -> List[str]:
+        """Word-wrap text to fit within a panel width."""
+        max_chars = (panel_width - 32) // 8
+        lines: List[str] = []
+        for paragraph in text.split("\n"):
             while len(paragraph) > max_chars:
                 split = paragraph[:max_chars].rfind(" ")
                 if split == -1:
@@ -569,11 +613,5 @@ class Display:
                 lines.append(paragraph[:split])
                 paragraph = paragraph[split:].lstrip()
             lines.append(paragraph)
-
-        ty = ry + 36
-        max_lines = (rh - 44) // 16
-        for line in lines[:max_lines]:
-            surf = self.font_xs.render(line, True, _TEXT)
-            self.screen.blit(surf, (rx + 16, ty))
-            ty += 16
+        return lines
 
