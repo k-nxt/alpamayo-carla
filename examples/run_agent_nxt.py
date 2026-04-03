@@ -22,6 +22,7 @@ import argparse
 import sys
 
 sys.path.insert(0, "..")
+sys.path.insert(0, "../src")
 
 from src.carla_alpamayo_agent_nxt import CarlaAlpamayoAgent, AgentConfig
 
@@ -144,6 +145,12 @@ def main():
         help="Spawn-point index for route destination (-1 = random, auto-replan on arrival)",
     )
 
+    # ── Debug ──
+    parser.add_argument(
+        "--debug-log", type=str, default=None, metavar="PATH",
+        help="Write per-tick debug CSV log (trajectory, steering, speed, control)",
+    )
+
     # ── Trajectory optimizer ──
     parser.add_argument(
         "--traj-opt", action="store_true",
@@ -208,6 +215,7 @@ def main():
         use_cfg_nav=args.cfg_nav,
         cfg_nav_guidance_weight=args.cfg_nav_weight,
         nav_destination_index=args.nav_dest,
+        debug_log_path=args.debug_log,
         traj_opt_enabled=args.traj_opt,
         traj_opt_smoothness_w=args.traj_opt_smooth,
         traj_opt_deviation_w=args.traj_opt_deviation,

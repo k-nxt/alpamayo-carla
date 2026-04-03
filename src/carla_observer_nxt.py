@@ -30,6 +30,7 @@ from scipy.spatial.transform import Rotation
 from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput, detect_model_version, VERSION_15
 from .sensor_manager_nxt import SensorManager, ALPAMAYO_CAMERA_ORDER, RESOLUTION_PRESETS
 from .display_nxt import Display
+from .nav_planner_nxt import nav_text_from_traffic_manager
 
 # ---------------------------------------------------------------------------
 # Constants (same as agent — must match Alpamayo-R1 expectations)
@@ -225,7 +226,7 @@ class CarlaObserver:
         self.sensor_manager: Optional[SensorManager] = None
         self.alpamayo: Optional[AlpamayoWrapper] = None
         self.display: Optional[Display] = None
-        self.nav_planner = None  # NavPlanner (Alpamayo 1.5 only)
+        self._nav_enabled = False
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -541,21 +542,13 @@ class CarlaObserver:
         if self.config.num_npc_vehicles > 0 or self.config.num_npc_walkers > 0:
             self._spawn_npc_traffic()
 
-        # Navigation planner (Alpamayo 1.5 only)
+        # Navigation via TrafficManager (Alpamayo 1.5 only)
         if (
             self.config.nav_enabled
             and detect_model_version(self.config.model_name) == VERSION_15
         ):
-            try:
-                from .nav_planner_nxt import NavPlanner
-                self.nav_planner = NavPlanner(self.world)
-                start = self.vehicle.get_location()
-                self.nav_planner.set_random_destination(start)
-                print("Navigation planner enabled (Alpamayo 1.5)")
-            except ImportError as e:
-                print(f"Warning: NavPlanner unavailable ({e}). "
-                      "Navigation instructions will be disabled.")
-                self.nav_planner = None
+            self._nav_enabled = True
+            print("Navigation enabled via TrafficManager (Alpamayo 1.5)")
 
         # Start inference worker thread
         self._worker_thread = threading.Thread(
@@ -817,14 +810,10 @@ class CarlaObserver:
                     if cam_frames is not None and hist is not None:
                         ego_xyz, ego_rot = hist
                         nav_text = None
-                        if self.nav_planner is not None:
-                            nav_text = self.nav_planner.get_instruction(
-                                self.vehicle.get_transform()
+                        if self._nav_enabled and self.traffic_manager is not None:
+                            nav_text = nav_text_from_traffic_manager(
+                                self.traffic_manager, self.vehicle,
                             )
-                            if self.nav_planner.route_complete:
-                                self.nav_planner.set_random_destination(
-                                    self.vehicle.get_location()
-                                )
                         self._shared["request"] = _InferenceRequest(
                             camera_frames=cam_frames,
                             ego_history_xyz=ego_xyz,
@@ -872,15 +861,20 @@ class CarlaObserver:
                     )
                     busy_tag = " [inferring]" if self.inference_busy else ""
                     cot = ""
+                    if self.last_output and self.last_output.meta_action:
+                        cot = f"[{self.last_output.meta_action.strip()[:30]}] "
                     if self.last_output and self.last_output.reasoning:
-                        cot = self.last_output.reasoning[:55].replace("\n", " ") + "…"
+                        cot += self.last_output.reasoning[:50].replace("\n", " ") + "…"
+                    nav = ""
+                    if self.last_nav_text:
+                        nav = f" | Nav: {self.last_nav_text}"
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
                         f"({self.last_inference_time:.2f}s) | "
                         f"Spd {st['speed_kmh']:5.1f} | "
                         f"Thr {st['throttle']:.2f} Brk {st['brake']:.2f} "
                         f"Str {st['steer']:+.2f} | "
-                        f"Delay {delay:3d}tick{busy_tag} | {cot}"
+                        f"Delay {delay:3d}tick{busy_tag}{nav} | {cot}"
                     )
 
         except KeyboardInterrupt:

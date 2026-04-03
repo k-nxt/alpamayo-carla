@@ -275,10 +275,14 @@ class AlpamayoWrapper:
 
         all_meta_actions: Optional[List[str]] = None
         meta_action: Optional[str] = None
+
         if "meta_action" in extra and extra["meta_action"].size > 0:
             ma_arr = extra["meta_action"][0, 0]
             all_meta_actions = [str(m) for m in ma_arr]
             meta_action = all_meta_actions[selected_idx]
+            if not meta_action:
+                all_meta_actions = None
+                meta_action = None
 
         return AlpamayoOutput(
             trajectory_xy=trajectory_xy,
