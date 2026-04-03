@@ -101,6 +101,9 @@ class AgentConfig:
     cfg_nav_guidance_weight: Optional[float] = None  # CFG alpha (None = model default)
     nav_destination_index: int = -1       # spawn-point index for route destination (-1 = random)
 
+    # Debug log
+    debug_log_path: Optional[str] = None   # CSV log file path (None = disabled)
+
     # Trajectory optimiser (post-processing for smoothness / comfort)
     traj_opt_enabled: bool = False          # enable trajectory optimisation
     traj_opt_smoothness_w: float = 1.0      # smoothness cost weight
@@ -179,10 +182,14 @@ class TrajectoryFollower:
         self._last_steer: float = 0.0          # EMA-smoothed steering
         self._raw_steer: float = 0.0           # instant steering (for display)
         self._hdg_weight: float = 0.0          # heading blend weight (for logging)
+        self._pp_steer: float = 0.0            # pure-pursuit component (for logging)
+        self._hdg_steer: float = 0.0           # heading component (for logging)
+        self._explicit_stop: bool = False       # trajectory < 0.5m (for logging)
         self._last_control: Optional[carla.VehicleControl] = None  # for logging
         self._standstill_ticks: int = 0        # consecutive ticks at ~0 speed
         self._curve_safe_speed: float = 999.0  # curvature-based speed limit (for logging)
         self._smoothed_curve_safe: float = 999.0  # EMA-smoothed curve-safe speed
+        self._short_traj_count: int = 0        # consecutive short-trajectory ticks
 
     def set_trajectory(
         self,
@@ -221,9 +228,11 @@ class TrajectoryFollower:
         #
         # Blend ratio: heading contribution increases with curvature.
 
-        # Speed-adaptive lookahead
+        # Speed-adaptive lookahead (conservative):
+        # keep high-speed lookahead close to the base distance to avoid
+        # under-steer at intersections / tight bends.
         la_base = self.lookahead_distance
-        la_adaptive = np.clip(la_base * (current_speed_ms / 5.0), 2.0, la_base * 2.0)
+        la_adaptive = np.clip(la_base * (0.6 + current_speed_ms / 12.0), 2.0, la_base)
 
         lookahead = self._find_lookahead_point(override_distance=la_adaptive)
         if lookahead is None:
@@ -244,10 +253,13 @@ class TrajectoryFollower:
             # Rig Y-left positive → CARLA steer-right positive ⇒ flip
             pp_steer = -pp_steer
 
+        self._pp_steer = pp_steer
+
         # --- Component 2: Heading-based steering ---
         # Use the heading at a point ~1-2s ahead to determine the
         # desired yaw change, then convert to a steering command.
         hdg_steer = self._heading_based_steer(current_speed_ms)
+        self._hdg_steer = hdg_steer
 
         # --- Adaptive blend ---
         # On straights (both components ≈ 0) Pure Pursuit dominates.
@@ -280,10 +292,33 @@ class TrajectoryFollower:
         # ── Speed target ──
         raw_speed = min(self._estimate_desired_speed(), self.max_speed_ms)
 
-        # If trajectory is extremely short, the model wants us to stop.
+        # ── Stop-intent detection ──
+        #
+        # The model signals "stop" via short trajectories.  A single
+        # short trajectory can be stochastic noise, so we track how
+        # many consecutive ticks produce short trajectories.
+        #
+        # STOP_TRAJ_THRESHOLD: trajectories shorter than this are
+        #   considered a "stop/slow" signal from the model.
+        # STOP_CONFIRM_TICKS: require this many consecutive short
+        #   trajectories before treating it as a genuine stop command
+        #   (overriding min_speed).
+        _STOP_TRAJ_THRESHOLD = 3.0   # meters
+        _STOP_CONFIRM_TICKS = 3      # consecutive ticks
+
+        if traj_length < _STOP_TRAJ_THRESHOLD:
+            self._short_traj_count += 1
+        else:
+            self._short_traj_count = 0
+
         explicit_stop = traj_length < 0.5
+        self._explicit_stop = explicit_stop
         if explicit_stop:
             raw_speed = 0.0
+
+        # Model wants to stop: confirmed by N consecutive short
+        # trajectories.  Don't force min_speed in this case.
+        model_wants_stop = self._short_traj_count >= _STOP_CONFIRM_TICKS
 
         self._raw_desired_speed = raw_speed
 
@@ -296,27 +331,13 @@ class TrajectoryFollower:
         desired_speed = alpha * raw_speed + (1.0 - alpha) * self._last_desired_speed
 
         # ── Curvature-based speed limit ──
-        # If the trajectory curves sharply, the car must slow down.
-        # We estimate the maximum curvature and compute a safe speed:
-        #   v_safe = sqrt(a_lat_max / κ)
         max_curv = self._estimate_max_curvature()
         _A_LAT_MAX = 2.5   # comfortable lateral acceleration (m/s²)
-        # NOTE: theoretical tyre grip ~5-6 m/s², but CARLA's physics
-        # simulation includes tyre slip which increases the effective
-        # turning radius.  2.5 accounts for this, providing a safety
-        # margin that prevents the car from going wide on sharp bends.
         if max_curv > 0.005:
             curve_safe_raw = float(np.sqrt(_A_LAT_MAX / max_curv))
         else:
             curve_safe_raw = 999.0
 
-        # Smooth curve_safe with asymmetric EMA:
-        #  - Fast decrease (α=0.7): react quickly to a tighter curve.
-        #  - Very slow increase (α=0.02): maintain caution for many ticks
-        #    after a curve is detected.  A single "straight" trajectory
-        #    from the stochastic model must NOT cause the car to
-        #    re-accelerate before the curve is actually cleared.
-        #    With α=0.02, recovery from curv=6.6 takes ~50 ticks.
         if curve_safe_raw < self._smoothed_curve_safe:
             cs_alpha = 0.7
         else:
@@ -328,17 +349,24 @@ class TrajectoryFollower:
         curve_safe = self._smoothed_curve_safe
         self._curve_safe_speed = curve_safe
 
-        # Apply minimum-speed floor — but NOT when the model explicitly
-        # commands a stop (very short trajectory) and NOT above the
-        # curvature-safe speed.  This prevents the domain-gap-induced
-        # speed dips on clear roads while still respecting genuine stop
-        # commands and physics-limited curve speeds.
-        if not explicit_stop and self.min_speed_ms > 0:
+        # ── Minimum speed floor ──
+        #
+        # Apply min_speed ONLY when the model is NOT signalling a stop.
+        # "model_wants_stop" = N consecutive short trajectories.
+        # This allows the car to cruise at min_speed on clear roads
+        # (where short trajectories are stochastic noise) while still
+        # stopping at red lights (where the model consistently produces
+        # short trajectories).
+        # If the model predicts a clear turn (larger steering demand),
+        # relax the min-speed floor so the car can slow down enough to rotate.
+        turning_intent = max(abs(self._pp_steer), abs(self._hdg_steer)) > 0.12
+        if self.min_speed_ms > 0 and not model_wants_stop:
             effective_min = min(self.min_speed_ms, curve_safe)
+            if turning_intent:
+                effective_min *= 0.6
             desired_speed = max(desired_speed, effective_min)
 
-        # Hard-cap: never exceed the curvature-safe speed even if EMA
-        # or min-speed pushed it higher.  This is the physics limit.
+        # Hard-cap: never exceed the curvature-safe speed.
         if curve_safe < 100.0:
             desired_speed = min(desired_speed, curve_safe)
 
@@ -651,6 +679,8 @@ class CarlaAlpamayoAgent:
         self.last_inference_time: float = 0.0  # seconds (wall clock)
         self.last_opt_result: Optional[OptimizationResult] = None
         self.last_nav_text: Optional[str] = None
+        self._debug_log_file = None
+        self._debug_log_writer = None
 
     # ==================================================================
     # Initialisation helpers
@@ -846,23 +876,16 @@ class CarlaAlpamayoAgent:
             self.config.nav_enabled
             and detect_model_version(self.config.model_name) == VERSION_15
         ):
-            try:
-                from .nav_planner_nxt import NavPlanner
-                self.nav_planner = NavPlanner(self.world)
-                # Plan initial route
-                start = self.vehicle.get_location()
-                if self.config.nav_destination_index >= 0:
-                    spawns = self.world.get_map().get_spawn_points()
-                    idx = min(self.config.nav_destination_index, len(spawns) - 1)
-                    self.nav_planner.set_route(start, spawns[idx].location)
-                    print(f"NavPlanner: route to spawn point {idx}")
-                else:
-                    self.nav_planner.set_random_destination(start)
-                print("Navigation planner enabled (Alpamayo 1.5)")
-            except ImportError as e:
-                print(f"Warning: NavPlanner unavailable ({e}). "
-                      "Navigation instructions will be disabled.")
-                self.nav_planner = None
+            from .nav_planner_nxt import NavPlanner
+            self.nav_planner = NavPlanner(self.world)
+            start = self.vehicle.get_location()
+            if self.config.nav_destination_index >= 0:
+                spawns = self.world.get_map().get_spawn_points()
+                idx = min(self.config.nav_destination_index, len(spawns) - 1)
+                self.nav_planner.set_destination(start, spawns[idx].location)
+            else:
+                self.nav_planner.set_random_destination(start)
+            print("Navigation planner enabled (Alpamayo 1.5)")
 
         # Pygame display (optional)
         if self.config.enable_display:
@@ -1031,10 +1054,8 @@ class CarlaAlpamayoAgent:
         if self.nav_planner is None:
             return None
         nav_text = self.nav_planner.get_instruction(self.vehicle.get_transform())
-        # Auto-replan when route is complete
         if self.nav_planner.route_complete:
-            start = self.vehicle.get_location()
-            self.nav_planner.set_random_destination(start)
+            self.nav_planner.set_random_destination(self.vehicle.get_location())
         return nav_text
 
     def step(self) -> Optional[AlpamayoOutput]:
@@ -1157,6 +1178,37 @@ class CarlaAlpamayoAgent:
             time.sleep(0.01)
         print("Warm-up complete – entering inference loop.\n")
 
+        # ── Debug CSV log ──
+        if cfg.debug_log_path:
+            import csv
+            self._debug_log_file = open(cfg.debug_log_path, "w", newline="")
+            self._debug_log_writer = csv.writer(self._debug_log_file)
+            self._debug_log_writer.writerow([
+                "tick", "inf_count", "inf_time_s",
+                "speed_kmh", "speed_ms",
+                # Trajectory summary
+                "traj_len_m", "traj_nwp", "explicit_stop",
+                "traj_wp0_x", "traj_wp0_y",
+                "traj_wp5_x", "traj_wp5_y",
+                "traj_wp15_x", "traj_wp15_y",
+                "traj_wp30_x", "traj_wp30_y",
+                # Speed estimation
+                "raw_desired_spd", "ema_desired_spd", "curve_safe_spd",
+                "min_speed_ms", "max_speed_ms",
+                # Steering
+                "pp_steer", "hdg_steer", "hdg_weight",
+                "raw_steer", "ema_steer",
+                # Control output
+                "throttle", "brake", "steer_out",
+                # Stop intent
+                "standstill_ticks", "short_traj_count", "model_wants_stop",
+                # Navigation
+                "nav_text",
+                # CoT
+                "cot",
+            ])
+            print(f"Debug log: {cfg.debug_log_path}")
+
         self.is_running = True
         tick = 0
 
@@ -1247,6 +1299,43 @@ class CarlaAlpamayoAgent:
                         f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} Str {steer_ema:+.2f} | "
                         f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{vote_tag}{curv_tag}{hdg_tag}{opt_tag}{nudge_tag}{nav_tag} | {cot}"
                     )
+
+                # ── Debug CSV ──
+                if self._debug_log_writer is not None:
+                    f = self.follower
+                    traj = f.trajectory
+                    nwp = len(traj) if traj is not None else 0
+
+                    def _wp(idx):
+                        if traj is not None and idx < nwp:
+                            return f"{traj[idx][0]:.3f}", f"{traj[idx][1]:.3f}"
+                        return "", ""
+
+                    st2 = self.get_vehicle_state()
+                    ctrl2 = f._last_control or carla.VehicleControl()
+                    cot_text = ""
+                    if output and output.reasoning:
+                        cot_text = output.reasoning[:80].replace("\n", " ")
+
+                    self._debug_log_writer.writerow([
+                        tick, self.inference_count, f"{self.last_inference_time:.3f}",
+                        f"{st2['speed_kmh']:.2f}", f"{st2['speed_ms']:.3f}",
+                        f"{f._trajectory_length() if traj is not None else 0:.2f}",
+                        nwp, int(f._explicit_stop),
+                        *_wp(0), *_wp(5), *_wp(15), *_wp(30),
+                        f"{f._raw_desired_speed:.3f}", f"{f._last_desired_speed:.3f}",
+                        f"{f._curve_safe_speed:.2f}",
+                        f"{f.min_speed_ms:.2f}", f"{f.max_speed_ms:.2f}",
+                        f"{f._pp_steer:.4f}", f"{f._hdg_steer:.4f}", f"{f._hdg_weight:.3f}",
+                        f"{f._raw_steer:.4f}", f"{f._last_steer:.4f}",
+                        f"{ctrl2.throttle:.3f}", f"{ctrl2.brake:.3f}", f"{ctrl2.steer:.4f}",
+                        f._standstill_ticks, f._short_traj_count,
+                        int(f._short_traj_count >= 3),
+                        self.last_nav_text or "",
+                        cot_text,
+                    ])
+                    self._debug_log_file.flush()
+
                 tick += 1
 
         except KeyboardInterrupt:
@@ -1260,6 +1349,11 @@ class CarlaAlpamayoAgent:
 
     def cleanup(self) -> None:
         print("Cleaning up…")
+        if self._debug_log_file:
+            self._debug_log_file.close()
+            self._debug_log_file = None
+            self._debug_log_writer = None
+            print("Debug log closed")
         if self.display:
             self.display.close()
             self.display = None
