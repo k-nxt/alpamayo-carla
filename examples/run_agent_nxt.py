@@ -115,6 +115,14 @@ def main():
         help="Simulation FPS (default 10.0 = 0.1s/tick, matching AR1 training)",
     )
     parser.add_argument(
+        "--npc-vehicles", type=int, default=0, metavar="N",
+        help="Number of NPC vehicles to spawn (default 0)",
+    )
+    parser.add_argument(
+        "--npc-walkers", type=int, default=0, metavar="N",
+        help="Number of NPC pedestrians to spawn (default 0)",
+    )
+    parser.add_argument(
         "--no-display", action="store_true",
         help="Disable pygame dashboard window",
     )
@@ -217,6 +225,8 @@ def main():
         vlm_temperature=args.temperature,
         vlm_top_p=args.top_p,
         sim_fps=args.sim_fps,
+        num_npc_vehicles=args.npc_vehicles,
+        num_npc_walkers=args.npc_walkers,
         inference_interval=args.inference_interval,
         enable_display=not args.no_display,
         record_path=args.record,

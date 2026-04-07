@@ -228,7 +228,11 @@ class Display:
             actual_path_rig=actual_path_rig,
             observer_mode=observer_mode,
         )
-        self._draw_reasoning(reasoning, meta_action=meta_action)
+        self._draw_reasoning(
+            reasoning,
+            meta_action=meta_action,
+            nav_text=nav_text,
+        )
 
         pygame.display.flip()
 
@@ -340,11 +344,6 @@ class Display:
 
         speed = state["speed_kmh"] if state else 0.0
         lines.append((f"Speed    {speed:6.1f} km/h", _TEXT))
-
-        # Navigation instruction — shown prominently right after speed
-        if nav_text:
-            _NAV_COLOR = (100, 220, 255)
-            lines.append((f">> {nav_text}", _NAV_COLOR))
 
         lines.append((f"Tick     {tick:6d}", _TEXT))
         lines.append((f"Infer #  {inf_count:6d}", _ACCENT))
@@ -557,6 +556,7 @@ class Display:
         self,
         reasoning: Optional[str],
         meta_action: Optional[str] = None,
+        nav_text: Optional[str] = None,
     ) -> None:
         rx = _HUD_W
         ry = _BOTTOM_Y + _BOTTOM_H // 2
@@ -566,7 +566,20 @@ class Display:
 
         ty = ry + 8
 
-        # ── Meta-action (compact, at the top of the panel) ──
+        # ── Navigation (between BEV and CoT, at panel top) ──
+        _NAV_COLOR = (100, 220, 255)
+        if nav_text:
+            nav_title = self.font.render("Navigation", True, _NAV_COLOR)
+            self.screen.blit(nav_title, (rx + 12, ty))
+            ty += 24
+            nav_lines = self._word_wrap(nav_text, rw)
+            for line in nav_lines[:2]:
+                surf = self.font_sm.render(line, True, _NAV_COLOR)
+                self.screen.blit(surf, (rx + 16, ty))
+                ty += 20
+            ty += 6
+
+        # ── Meta-action (compact, under navigation) ──
         _META_COLOR = (255, 210, 80)
         if meta_action:
             title_ma = self.font.render("Meta-Action", True, _META_COLOR)

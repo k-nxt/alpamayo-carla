@@ -153,6 +153,8 @@ python run_agent_nxt.py --model nvidia/Alpamayo-1.5-10B --no-nav --frames 500
 | `--temperature` | `0.6` | VLM テキスト生成温度（低い=決定論的） |
 | `--top-p` | `0.98` | Nucleus sampling 閾値 |
 | `--sim-fps` | `10.0` | シミュレーション FPS（10Hz = 0.1秒/ティック、訓練時と同一） |
+| `--npc-vehicles N` | `0` | スポーンするNPC車両数 |
+| `--npc-walkers N` | `0` | スポーンするNPC歩行者数 |
 | `--inference-interval` | `1` | N ティックごとに推論実行 |
 | `--no-display` | `false` | Pygame ダッシュボード無効化 |
 | `--record PATH` | *(なし)* | MP4 録画出力先 |

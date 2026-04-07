@@ -80,6 +80,8 @@ class AgentConfig:
     # Simulation
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
     inference_interval: int = 1   # run inference every tick (= every 0.1 s)
+    num_npc_vehicles: int = 0     # number of NPC vehicles to spawn
+    num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
 
     # Control
     max_speed_kmh: float = 30.0
@@ -661,6 +663,7 @@ class CarlaAlpamayoAgent:
         self.world: Optional[carla.World] = None
         self.vehicle: Optional[carla.Actor] = None
         self.spectator: Optional[carla.Actor] = None
+        self.traffic_manager = None
 
         # Sub-components
         self.sensor_manager: Optional[SensorManager] = None
@@ -683,6 +686,9 @@ class CarlaAlpamayoAgent:
         self.last_nav_text: Optional[str] = None
         self._debug_log_file = None
         self._debug_log_writer = None
+        self._npc_vehicles: list = []
+        self._npc_walkers: list = []       # walker actors
+        self._npc_walker_ctrls: list = []  # AI controller actors
 
     # ==================================================================
     # Initialisation helpers
@@ -802,6 +808,127 @@ class CarlaAlpamayoAgent:
             f"Use 'full', 'half', 'low', or 'WxH' (e.g. '640x360')."
         )
 
+    def _spawn_npc_traffic(self) -> None:
+        """Spawn NPC vehicles and pedestrians with autopilot / AI control."""
+        import random
+
+        cfg = self.config
+        tm_port = 8000
+        if self.traffic_manager is None:
+            self.traffic_manager = self.client.get_trafficmanager(tm_port)
+            self.traffic_manager.set_synchronous_mode(True)
+
+        # ── NPC vehicles ──
+        if cfg.num_npc_vehicles > 0:
+            bp_lib = self.world.get_blueprint_library()
+            vehicle_bps = bp_lib.filter("vehicle.*")
+            # Exclude bicycles / motorcycles for stability
+            vehicle_bps = [
+                bp for bp in vehicle_bps
+                if int(bp.get_attribute("number_of_wheels")) >= 4
+            ]
+
+            spawns = self.world.get_map().get_spawn_points()
+            random.shuffle(spawns)
+
+            count = 0
+            for sp in spawns[:cfg.num_npc_vehicles + 10]:
+                if count >= cfg.num_npc_vehicles:
+                    break
+                bp = random.choice(vehicle_bps)
+                # Randomise color
+                if bp.has_attribute("color"):
+                    colors = bp.get_attribute("color").recommended_values
+                    bp.set_attribute("color", random.choice(colors))
+                bp.set_attribute("role_name", "npc")
+                try:
+                    npc = self.world.spawn_actor(bp, sp)
+                    npc.set_autopilot(True, tm_port)
+                    self._npc_vehicles.append(npc)
+                    count += 1
+                except RuntimeError:
+                    continue
+
+            print(f"Spawned {count} NPC vehicles")
+
+        # ── NPC pedestrians (walkers) ──
+        if cfg.num_npc_walkers > 0:
+            bp_lib = self.world.get_blueprint_library()
+            walker_bps = bp_lib.filter("walker.pedestrian.*")
+
+            spawn_points = []
+            for _ in range(cfg.num_npc_walkers + 20):
+                loc = self.world.get_random_location_from_navigation()
+                if loc is not None:
+                    spawn_points.append(carla.Transform(location=loc))
+
+            count = 0
+            for sp in spawn_points[:cfg.num_npc_walkers + 10]:
+                if count >= cfg.num_npc_walkers:
+                    break
+                bp = random.choice(walker_bps)
+                if bp.has_attribute("is_invincible"):
+                    bp.set_attribute("is_invincible", "false")
+                try:
+                    walker = self.world.spawn_actor(bp, sp)
+                    self._npc_walkers.append(walker)
+                    count += 1
+                except RuntimeError:
+                    continue
+
+            # Spawn AI controllers for each walker
+            ctrl_bp = self.world.get_blueprint_library().find("controller.ai.walker")
+            for walker in self._npc_walkers:
+                try:
+                    ctrl = self.world.spawn_actor(ctrl_bp, carla.Transform(), walker)
+                    self._npc_walker_ctrls.append(ctrl)
+                except RuntimeError:
+                    self._npc_walker_ctrls.append(None)
+
+            # Need one tick for controllers to initialise
+            self.world.tick()
+
+            # Start walking to random destinations
+            for ctrl in self._npc_walker_ctrls:
+                if ctrl is None:
+                    continue
+                ctrl.start()
+                dest = self.world.get_random_location_from_navigation()
+                if dest is not None:
+                    ctrl.go_to_location(dest)
+                ctrl.set_max_speed(1.0 + random.random() * 1.5)  # 1.0–2.5 m/s
+
+            print(f"Spawned {count} NPC walkers")
+
+    def _destroy_npc_traffic(self) -> None:
+        """Destroy all NPC actors (tolerant of already-dead actors)."""
+        # Stop walker controllers first
+        for ctrl in self._npc_walker_ctrls:
+            try:
+                if ctrl is not None and ctrl.is_alive:
+                    ctrl.stop()
+                    ctrl.destroy()
+            except RuntimeError:
+                pass
+        self._npc_walker_ctrls.clear()
+
+        for walker in self._npc_walkers:
+            try:
+                if walker is not None and walker.is_alive:
+                    walker.destroy()
+            except RuntimeError:
+                pass
+        self._npc_walkers.clear()
+
+        for npc in self._npc_vehicles:
+            try:
+                if npc is not None and npc.is_alive:
+                    npc.set_autopilot(False)
+                    npc.destroy()
+            except RuntimeError:
+                pass
+        self._npc_vehicles.clear()
+
     def setup_sensors(self) -> None:
         # subsample_factor: cameras fire every sim tick.
         # At 10 FPS each tick is 0.1 s, matching AR1 training data → factor=1.
@@ -872,6 +999,10 @@ class CarlaAlpamayoAgent:
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.config.sim_fps
         self.world.apply_settings(settings)
+
+        # Spawn NPC traffic
+        if self.config.num_npc_vehicles > 0 or self.config.num_npc_walkers > 0:
+            self._spawn_npc_traffic()
 
         # Navigation planner (Alpamayo 1.5 only)
         if (
@@ -1354,6 +1485,7 @@ class CarlaAlpamayoAgent:
 
     def cleanup(self) -> None:
         print("Cleaning up…")
+        self._destroy_npc_traffic()
         if self._debug_log_file:
             self._debug_log_file.close()
             self._debug_log_file = None
@@ -1371,6 +1503,12 @@ class CarlaAlpamayoAgent:
             settings = self.world.get_settings()
             settings.synchronous_mode = False
             self.world.apply_settings(settings)
+        if self.traffic_manager:
+            try:
+                self.traffic_manager.set_synchronous_mode(False)
+            except RuntimeError:
+                pass
+            self.traffic_manager = None
         print("Cleanup complete")
 
     def __enter__(self):
