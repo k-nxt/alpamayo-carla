@@ -71,7 +71,7 @@ class AgentConfig:
     use_dummy_model: bool = False
     context_length: int = 4       # temporal image frames
     num_traj_samples: int = 6
-    max_generation_length: int = 64   # VLM max tokens (shorter = faster, CoT truncated)
+    max_generation_length: int = 256  # VLM max tokens (64 is faster but may truncate reasoning)
     diffusion_steps: int = 5          # Flow-matching denoising steps (default 10, 5 for speed)
     cam_resolution: str = "full"      # Camera resolution: "full", "half", "low", or "WxH"
     vlm_temperature: float = 0.6      # VLM text-generation temperature (lower = more deterministic)
@@ -100,6 +100,8 @@ class AgentConfig:
     use_cfg_nav: bool = False             # use classifier-free guidance for nav
     cfg_nav_guidance_weight: Optional[float] = None  # CFG alpha (None = model default)
     nav_destination_index: int = -1       # spawn-point index for route destination (-1 = random)
+    nav_text_override: Optional[str] = None  # fixed nav text for debugging (overrides planner)
+    use_camera_indices: bool = True       # include camera indices in 1.5 prompt construction
 
     # Debug log
     debug_log_path: Optional[str] = None   # CSV log file path (None = disabled)
@@ -1073,7 +1075,9 @@ class CarlaAlpamayoAgent:
                 ego_xyz, ego_rot = hist
 
                 # Navigation instruction (Alpamayo 1.5 only)
-                nav_text = self._get_nav_text()
+                nav_text = self.config.nav_text_override
+                if nav_text is None:
+                    nav_text = self._get_nav_text()
                 self.last_nav_text = nav_text
 
                 t0 = time.perf_counter()
@@ -1089,6 +1093,7 @@ class CarlaAlpamayoAgent:
                         nav_text=nav_text,
                         use_cfg_nav=self.config.use_cfg_nav,
                         cfg_nav_guidance_weight=self.config.cfg_nav_guidance_weight,
+                        use_camera_indices=self.config.use_camera_indices,
                     )
                 self.last_inference_time = time.perf_counter() - t0
 

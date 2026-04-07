@@ -146,6 +146,7 @@ class AlpamayoWrapper:
         nav_text: Optional[str] = None,
         use_cfg_nav: bool = False,
         cfg_nav_guidance_weight: Optional[float] = None,
+        use_camera_indices: bool = True,
     ) -> AlpamayoOutput:
         """
         Run Alpamayo inference.
@@ -163,6 +164,9 @@ class AlpamayoWrapper:
                 conditioning (Alpamayo 1.5 only).  Requires ``nav_text``.
             cfg_nav_guidance_weight: CFG guidance weight (alpha).
                 Only used when ``use_cfg_nav=True``.
+            use_camera_indices: Pass camera-index annotations to
+                ``helper.create_message`` (Alpamayo 1.5 only). Disable
+                this for A/B comparison against index-free prompting.
 
         Returns:
             AlpamayoOutput with predicted trajectory and reasoning.
@@ -171,7 +175,7 @@ class AlpamayoWrapper:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         helper = self._helper
-        from .sensor_manager_nxt import ALPAMAYO_CAMERA_ORDER
+        from .sensor_manager_nxt import ALPAMAYO_CAMERA_ORDER, ALPAMAYO_CAMERA_INDEX
 
         all_frames: List[torch.Tensor] = []
         for cam_name in ALPAMAYO_CAMERA_ORDER:
@@ -183,10 +187,23 @@ class AlpamayoWrapper:
 
         # Build chat messages (version-dependent)
         if self.is_v15:
-            messages = helper.create_message(
-                image_tensor,
-                nav_text=nav_text,
-            )
+            create_message_kwargs = {
+                "nav_text": nav_text,
+                # In no-nav mode, keep the nav-style prompt format for a fair
+                # baseline instead of switching to a different instruction style.
+                "use_nav_prompt": (nav_text is None),
+            }
+            if use_camera_indices:
+                # Alpamayo 1.5 expects camera-index annotations in the prompt
+                # to match the training message format.
+                create_message_kwargs["camera_indices"] = torch.tensor(
+                    [ALPAMAYO_CAMERA_INDEX[name] for name in ALPAMAYO_CAMERA_ORDER],
+                    dtype=torch.long,
+                )
+                create_message_kwargs["num_frames_per_camera"] = len(
+                    camera_frames[ALPAMAYO_CAMERA_ORDER[0]]
+                )
+            messages = helper.create_message(image_tensor, **create_message_kwargs)
         else:
             messages = helper.create_message(image_tensor)
 

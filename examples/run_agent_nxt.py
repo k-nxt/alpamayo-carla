@@ -83,8 +83,8 @@ def main():
              "Lower values increase steering sensitivity.",
     )
     parser.add_argument(
-        "--max-gen-len", type=int, default=64,
-        help="VLM max generation tokens (default 64; 256 for full CoT)",
+        "--max-gen-len", type=int, default=256,
+        help="VLM max generation tokens (default 256; use 64 for faster but weaker reasoning)",
     )
     parser.add_argument(
         "--num-traj-samples", type=int, default=6,
@@ -141,8 +141,18 @@ def main():
         help="CFG guidance weight for navigation (1.5 only; None = model default)",
     )
     parser.add_argument(
+        "--no-camera-indices", action="store_true",
+        help="Do not pass camera_indices into Alpamayo 1.5 prompt construction "
+             "(for A/B testing)",
+    )
+    parser.add_argument(
         "--nav-dest", type=int, default=-1, metavar="IDX",
         help="Spawn-point index for route destination (-1 = random, auto-replan on arrival)",
+    )
+    parser.add_argument(
+        "--nav-text", type=str, default=None, metavar="TEXT",
+        help="Force a fixed navigation instruction text (1.5 only). "
+             "If set, this overrides planner-generated navigation.",
     )
 
     # ── Debug ──
@@ -214,7 +224,9 @@ def main():
         nav_enabled=not args.no_nav,
         use_cfg_nav=args.cfg_nav,
         cfg_nav_guidance_weight=args.cfg_nav_weight,
+        use_camera_indices=not args.no_camera_indices,
         nav_destination_index=args.nav_dest,
+        nav_text_override=args.nav_text,
         debug_log_path=args.debug_log,
         traj_opt_enabled=args.traj_opt,
         traj_opt_smoothness_w=args.traj_opt_smooth,

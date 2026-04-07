@@ -81,7 +81,7 @@ class ObserverConfig:
     use_dummy_model: bool = False
     context_length: int = 4
     num_traj_samples: int = 6
-    max_generation_length: int = 64
+    max_generation_length: int = 256
     diffusion_steps: int = 5
     cam_resolution: str = "full"
     vlm_temperature: float = 0.6
@@ -91,6 +91,8 @@ class ObserverConfig:
     nav_enabled: bool = True              # enable nav instructions (auto-disabled for R1)
     use_cfg_nav: bool = False             # use classifier-free guidance for nav
     cfg_nav_guidance_weight: Optional[float] = None
+    nav_text_override: Optional[str] = None  # fixed nav text for debugging (overrides TM nav)
+    use_camera_indices: bool = True          # include camera indices in 1.5 prompt construction
 
     # Simulation
     sim_fps: float = 10.0
@@ -161,6 +163,7 @@ def _inference_worker(
                 nav_text=req.nav_text,
                 use_cfg_nav=config.use_cfg_nav,
                 cfg_nav_guidance_weight=config.cfg_nav_guidance_weight,
+                use_camera_indices=config.use_camera_indices,
             )
         elapsed = time.perf_counter() - t0
 
@@ -809,8 +812,12 @@ class CarlaObserver:
                     hist = self._build_ego_history_tensors()
                     if cam_frames is not None and hist is not None:
                         ego_xyz, ego_rot = hist
-                        nav_text = None
-                        if self._nav_enabled and self.traffic_manager is not None:
+                        nav_text = self.config.nav_text_override
+                        if (
+                            nav_text is None
+                            and self._nav_enabled
+                            and self.traffic_manager is not None
+                        ):
                             nav_text = nav_text_from_traffic_manager(
                                 self.traffic_manager, self.vehicle,
                             )
