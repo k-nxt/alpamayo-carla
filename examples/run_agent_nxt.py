@@ -107,6 +107,10 @@ def main():
         help="VLM nucleus-sampling threshold (default 0.98)",
     )
     parser.add_argument(
+        "--timing-log", action="store_true",
+        help="Print per-inference timing breakdown (prep/model/post/total)",
+    )
+    parser.add_argument(
         "--inference-interval", type=int, default=1,
         help="Run inference every N simulation ticks (default 1 → every tick)",
     )
@@ -224,6 +228,7 @@ def main():
         cam_resolution=args.cam_res,
         vlm_temperature=args.temperature,
         vlm_top_p=args.top_p,
+        timing_log=args.timing_log,
         sim_fps=args.sim_fps,
         num_npc_vehicles=args.npc_vehicles,
         num_npc_walkers=args.npc_walkers,

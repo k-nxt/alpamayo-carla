@@ -76,6 +76,7 @@ class AgentConfig:
     cam_resolution: str = "full"      # Camera resolution: "full", "half", "low", or "WxH"
     vlm_temperature: float = 0.6      # VLM text-generation temperature (lower = more deterministic)
     vlm_top_p: float = 0.98           # VLM nucleus-sampling threshold
+    timing_log: bool = False          # print per-inference timing breakdown
 
     # Simulation
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
@@ -954,6 +955,7 @@ class CarlaAlpamayoAgent:
             num_traj_samples=self.config.num_traj_samples,
             top_p=self.config.vlm_top_p,
             temperature=self.config.vlm_temperature,
+            timing_log=self.config.timing_log,
         )
         if self.config.use_dummy_model:
             print("Using dummy model for testing (no GPU required)")

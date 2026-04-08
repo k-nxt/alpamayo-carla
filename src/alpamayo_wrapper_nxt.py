@@ -14,6 +14,7 @@ Output: trajectory waypoints in rig frame + chain-of-thought reasoning
 
 import torch
 import numpy as np
+import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from types import ModuleType
@@ -71,12 +72,14 @@ class AlpamayoWrapper:
         num_traj_samples: int = 6,
         top_p: float = 0.98,
         temperature: float = 0.6,
+        timing_log: bool = False,
     ):
         self.model_name = model_name
         self.device = device
         self.num_traj_samples = num_traj_samples
         self.top_p = top_p
         self.temperature = temperature
+        self.timing_log = timing_log
 
         self.model_version: str = detect_model_version(model_name)
         self.model = None
@@ -173,10 +176,12 @@ class AlpamayoWrapper:
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+        t_start = time.perf_counter()
 
         helper = self._helper
         from .sensor_manager_nxt import ALPAMAYO_CAMERA_ORDER, ALPAMAYO_CAMERA_INDEX
 
+        t_prep_start = time.perf_counter()
         all_frames: List[torch.Tensor] = []
         for cam_name in ALPAMAYO_CAMERA_ORDER:
             for img_hwc in camera_frames[cam_name]:
@@ -222,6 +227,7 @@ class AlpamayoWrapper:
             "ego_history_rot": ego_history_rot,
         }
         model_inputs = helper.to_device(model_inputs, self.device)
+        t_prep_end = time.perf_counter()
 
         diffusion_kwargs = None
         if diffusion_steps is not None:
@@ -234,6 +240,7 @@ class AlpamayoWrapper:
             and nav_text is not None
         )
 
+        t_model_start = time.perf_counter()
         with torch.autocast(self.device, dtype=self.DTYPE):
             if use_cfg:
                 if diffusion_kwargs is None:
@@ -263,8 +270,29 @@ class AlpamayoWrapper:
                         return_extra=True,
                     )
                 )
+        t_model_end = time.perf_counter()
 
-        return self._postprocess(pred_xyz, extra)
+        output = self._postprocess(pred_xyz, extra)
+        t_end = time.perf_counter()
+
+        if self.timing_log:
+            prep_ms = (t_prep_end - t_prep_start) * 1000.0
+            model_ms = (t_model_end - t_model_start) * 1000.0
+            post_ms = (t_end - t_model_end) * 1000.0
+            total_ms = (t_end - t_start) * 1000.0
+            print(
+                "[timing] "
+                f"prep={prep_ms:.1f}ms "
+                f"model={model_ms:.1f}ms "
+                f"post={post_ms:.1f}ms "
+                f"total={total_ms:.1f}ms "
+                f"samples={self.num_traj_samples} "
+                f"max_gen={max_generation_length} "
+                f"diff_steps={diffusion_steps if diffusion_steps is not None else 'default'} "
+                f"cfg_nav={use_cfg}"
+            )
+
+        return output
 
     def _postprocess(
         self,

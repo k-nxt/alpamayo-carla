@@ -86,6 +86,7 @@ class ObserverConfig:
     cam_resolution: str = "full"
     vlm_temperature: float = 0.6
     vlm_top_p: float = 0.98
+    timing_log: bool = False              # print per-inference timing breakdown
 
     # Navigation (Alpamayo 1.5)
     nav_enabled: bool = True              # enable nav instructions (auto-disabled for R1)
@@ -518,6 +519,7 @@ class CarlaObserver:
             num_traj_samples=self.config.num_traj_samples,
             top_p=self.config.vlm_top_p,
             temperature=self.config.vlm_temperature,
+            timing_log=self.config.timing_log,
         )
         if self.config.use_dummy_model:
             print("Using dummy model for testing (no GPU required)")

@@ -133,6 +133,10 @@ def main():
         help="VLM nucleus-sampling threshold",
     )
     parser.add_argument(
+        "--timing-log", action="store_true",
+        help="Print per-inference timing breakdown (prep/model/post/total)",
+    )
+    parser.add_argument(
         "--sim-fps", type=float, default=10.0,
         help="Simulation FPS (default 10.0)",
     )
@@ -179,6 +183,7 @@ def main():
         cam_resolution=args.cam_res,
         vlm_temperature=args.temperature,
         vlm_top_p=args.top_p,
+        timing_log=args.timing_log,
         sim_fps=args.sim_fps,
         enable_display=not args.no_display,
         record_path=args.record,
