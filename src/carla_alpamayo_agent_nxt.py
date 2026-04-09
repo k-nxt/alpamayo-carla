@@ -84,6 +84,7 @@ class AgentConfig:
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
     inference_interval: int = 1   # run inference every tick (= every 0.1 s)
     inference_interval_sec: Optional[float] = None  # optional wall-clock inference interval
+    use_async_inference: bool = True  # run model inference in background worker thread
     num_npc_vehicles: int = 0     # number of NPC vehicles to spawn
     num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
 
@@ -1310,25 +1311,30 @@ class CarlaAlpamayoAgent:
                 self.nav_planner.set_random_destination(start)
             print("Navigation planner enabled (Alpamayo 1.5)")
 
-        # Start inference worker thread
+        # Start inference worker thread (optional)
         self._stop_event.clear()
         self._request_event.clear()
         self._result_event.clear()
         self._shared.clear()
         self.inference_busy = False
-        self._worker_thread = threading.Thread(
-            target=_inference_worker,
-            args=(
-                self.alpamayo,
-                self.config,
-                self._request_event,
-                self._result_event,
-                self._shared,
-                self._stop_event,
-            ),
-            daemon=True,
-        )
-        self._worker_thread.start()
+        if self.config.use_async_inference:
+            self._worker_thread = threading.Thread(
+                target=_inference_worker,
+                args=(
+                    self.alpamayo,
+                    self.config,
+                    self._request_event,
+                    self._result_event,
+                    self._shared,
+                    self._stop_event,
+                ),
+                daemon=True,
+            )
+            self._worker_thread.start()
+            print("Inference execution: async worker thread")
+        else:
+            self._worker_thread = None
+            print("Inference execution: synchronous (main thread)")
 
         # Pygame display (optional)
         if self.config.enable_display:
@@ -1546,44 +1552,98 @@ class CarlaAlpamayoAgent:
         self.follower.set_trajectory(traj_xy, headings)
         self.inference_count += 1
 
+    def _run_inference_now(
+        self,
+        cam_frames: Dict[str, list],
+        ego_xyz: torch.Tensor,
+        ego_rot: torch.Tensor,
+        nav_text: Optional[str],
+    ) -> _InferenceResult:
+        """Run one inference synchronously in the current thread."""
+        t0 = time.perf_counter()
+        if self.config.use_dummy_model:
+            output = self.alpamayo.predict_dummy()
+        else:
+            output = self.alpamayo.predict(
+                camera_frames=cam_frames,
+                ego_history_xyz=ego_xyz,
+                ego_history_rot=ego_rot,
+                max_generation_length=self.config.max_generation_length,
+                diffusion_steps=self.config.diffusion_steps,
+                nav_text=nav_text,
+                use_cfg_nav=self.config.use_cfg_nav,
+                cfg_nav_guidance_weight=self.config.cfg_nav_guidance_weight,
+                use_camera_indices=self.config.use_camera_indices,
+            )
+        elapsed = time.perf_counter() - t0
+        return _InferenceResult(
+            output=output,
+            submit_tick=self.tick_count,
+            inference_time=elapsed,
+            nav_text=nav_text,
+        )
+
     def step(self) -> Optional[AlpamayoOutput]:
         """Execute one simulation tick; optionally run inference."""
         self._record_ego_pose()
         state = self.get_vehicle_state()
         self.tick_count += 1
 
-        # --- consume completed inference result ---
-        if self._result_event.is_set():
-            self._result_event.clear()
-            result: Optional[_InferenceResult] = self._shared.get("result")
-            if result is not None:
-                self.last_inference_time = result.inference_time
-                self.last_result_tick = result.submit_tick
-                self.last_nav_text = result.nav_text
-                self.inference_busy = False
-                self._apply_inference_result(result.output)
+        if self.config.use_async_inference:
+            # --- consume completed inference result ---
+            if self._result_event.is_set():
+                self._result_event.clear()
+                result: Optional[_InferenceResult] = self._shared.get("result")
+                if result is not None:
+                    self.last_inference_time = result.inference_time
+                    self.last_result_tick = result.submit_tick
+                    self.last_nav_text = result.nav_text
+                    self.inference_busy = False
+                    self._apply_inference_result(result.output)
 
-        # --- submit inference request if idle ---
-        if not self.inference_busy and self._should_run_inference():
-            cam_frames = self._prepare_camera_frames()
-            hist = self._build_ego_history_tensors()
-            if cam_frames is not None and hist is not None:
-                ego_xyz, ego_rot = hist
-                nav_text = self.config.nav_text_override
-                if nav_text is None:
-                    nav_text = self._get_nav_text()
+            # --- submit inference request if idle ---
+            if not self.inference_busy and self._should_run_inference():
+                cam_frames = self._prepare_camera_frames()
+                hist = self._build_ego_history_tensors()
+                if cam_frames is not None and hist is not None:
+                    ego_xyz, ego_rot = hist
+                    nav_text = self.config.nav_text_override
+                    if nav_text is None:
+                        nav_text = self._get_nav_text()
 
-                self._shared["request"] = _InferenceRequest(
-                    camera_frames=cam_frames,
-                    ego_history_xyz=ego_xyz,
-                    ego_history_rot=ego_rot,
-                    submit_tick=self.tick_count,
-                    nav_text=nav_text,
-                )
-                self._request_event.set()
-                self.inference_busy = True
-                self.last_nav_text = nav_text
-                self._last_inference_submit_wall_time = time.monotonic()
+                    self._shared["request"] = _InferenceRequest(
+                        camera_frames=cam_frames,
+                        ego_history_xyz=ego_xyz,
+                        ego_history_rot=ego_rot,
+                        submit_tick=self.tick_count,
+                        nav_text=nav_text,
+                    )
+                    self._request_event.set()
+                    self.inference_busy = True
+                    self.last_nav_text = nav_text
+                    self._last_inference_submit_wall_time = time.monotonic()
+        else:
+            # --- synchronous inference on main thread ---
+            if self._should_run_inference():
+                cam_frames = self._prepare_camera_frames()
+                hist = self._build_ego_history_tensors()
+                if cam_frames is not None and hist is not None:
+                    ego_xyz, ego_rot = hist
+                    nav_text = self.config.nav_text_override
+                    if nav_text is None:
+                        nav_text = self._get_nav_text()
+                    self.last_nav_text = nav_text
+                    self._last_inference_submit_wall_time = time.monotonic()
+
+                    result = self._run_inference_now(
+                        cam_frames=cam_frames,
+                        ego_xyz=ego_xyz,
+                        ego_rot=ego_rot,
+                        nav_text=nav_text,
+                    )
+                    self.last_inference_time = result.inference_time
+                    self.last_result_tick = result.submit_tick
+                    self._apply_inference_result(result.output)
 
         # --- control ---
         control = self.follower.compute_control(state["speed_ms"])
