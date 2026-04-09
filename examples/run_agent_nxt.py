@@ -62,7 +62,7 @@ def main():
         help="HuggingFace model ID or local path (e.g. nvidia/Alpamayo-R1-10B for R1)",
     )
     parser.add_argument(
-        "--max-speed", type=float, default=30.0,
+        "--max-speed", type=float, default=35.0,
         help="Max speed in km/h",
     )
     parser.add_argument(
@@ -87,12 +87,12 @@ def main():
         help="VLM max generation tokens (default 256; use 64 for faster but weaker reasoning)",
     )
     parser.add_argument(
-        "--num-traj-samples", type=int, default=6,
-        help="Number of trajectory candidates per inference (default 6)",
+        "--num-traj-samples", type=int, default=1,
+        help="Number of trajectory candidates per inference (default 1  1-16)",
     )
     parser.add_argument(
-        "--diffusion-steps", type=int, default=5,
-        help="Flow-matching diffusion steps (default 5; original 10)",
+        "--diffusion-steps", type=int, default=10,
+        help="Flow-matching diffusion steps (default 10; original 10)",
     )
     parser.add_argument(
         "--cam-res", type=str, default="full",
@@ -131,7 +131,7 @@ def main():
         help="Simulation FPS (default 10.0 = 0.1s/tick, matching AR1 training)",
     )
     parser.add_argument(
-        "--control-mode", type=str, default="legacy", choices=["legacy", "official-pid"],
+        "--control-mode", type=str, default="official_pid", choices=["legacy", "official_pid"],
         help="Control mode: legacy follower or CARLA official PID follower",
     )
     parser.add_argument(
