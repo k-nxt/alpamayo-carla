@@ -50,6 +50,7 @@ class EgoPose:
     timestamp_us: int
     location: np.ndarray          # (3,) world x y z
     rotation_matrix: np.ndarray   # (3, 3) world rotation
+    rotation_quat: np.ndarray     # (4,) world rotation quaternion (x, y, z, w)
 
 
 @dataclass
@@ -1065,6 +1066,7 @@ class CarlaAlpamayoAgent:
                 timestamp_us=timestamp_us,
                 location=rear_axle_world,
                 rotation_matrix=rotation_matrix,
+                rotation_quat=r.as_quat(),
             )
         )
 
@@ -1089,7 +1091,9 @@ class CarlaAlpamayoAgent:
             return None
 
         current = self.ego_history[-1]
-        R_cur_inv = current.rotation_matrix.T           # inverse rotation
+        cur_rot = Rotation.from_quat(current.rotation_quat)
+        cur_rot_inv = cur_rot.inv()
+        R_cur_inv = current.rotation_matrix.T           # inverse rotation (for xyz transform)
 
         # Flip matrix: CARLA (Y right) → rig (Y left)
         F = np.diag([1.0, -1.0, 1.0])
@@ -1108,8 +1112,10 @@ class CarlaAlpamayoAgent:
             delta_rig = F @ delta_local
             history_xyz.append(delta_rig)
 
-            # Rotation: relative to current, then flip to rig
-            R_rel = R_cur_inv @ pose.rotation_matrix
+            # Rotation: match alpamayo1.5 loader logic:
+            # (R_t0^-1 * R_t).as_matrix(), then CARLA(Y-right)->rig(Y-left) flip.
+            pose_rot = Rotation.from_quat(pose.rotation_quat)
+            R_rel = (cur_rot_inv * pose_rot).as_matrix()
             R_rel_rig = F @ R_rel @ F
             history_rot.append(R_rel_rig)
 

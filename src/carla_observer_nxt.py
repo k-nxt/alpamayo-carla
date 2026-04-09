@@ -50,6 +50,7 @@ class EgoPose:
     timestamp_us: int
     location: np.ndarray          # (3,) world x y z
     rotation_matrix: np.ndarray   # (3, 3) world rotation
+    rotation_quat: np.ndarray     # (4,) world rotation quaternion (x, y, z, w)
 
 
 @dataclass
@@ -604,6 +605,7 @@ class CarlaObserver:
             timestamp_us=timestamp_us,
             location=rear_axle_world,
             rotation_matrix=rotation_matrix,
+            rotation_quat=r.as_quat(),
         )
         self.ego_history.append(pose)
 
@@ -625,6 +627,8 @@ class CarlaObserver:
             return None
 
         current = self.ego_history[-1]
+        cur_rot = Rotation.from_quat(current.rotation_quat)
+        cur_rot_inv = cur_rot.inv()
         R_cur_inv = current.rotation_matrix.T
 
         F = np.diag([1.0, -1.0, 1.0])
@@ -642,7 +646,8 @@ class CarlaObserver:
             delta_rig = F @ delta_local
             history_xyz.append(delta_rig)
 
-            R_rel = R_cur_inv @ pose.rotation_matrix
+            pose_rot = Rotation.from_quat(pose.rotation_quat)
+            R_rel = (cur_rot_inv * pose_rot).as_matrix()
             R_rel_rig = F @ R_rel @ F
             history_rot.append(R_rel_rig)
 

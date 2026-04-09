@@ -226,6 +226,10 @@ class AlpamayoWrapper:
             "ego_history_xyz": ego_history_xyz,
             "ego_history_rot": ego_history_rot,
         }
+
+        #print(model_inputs["ego_history_xyz"])
+        #print(model_inputs["ego_history_rot"])
+
         model_inputs = helper.to_device(model_inputs, self.device)
         t_prep_end = time.perf_counter()
 
