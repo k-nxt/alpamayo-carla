@@ -84,7 +84,7 @@ class AgentConfig:
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
     inference_interval: int = 1   # run inference every tick (= every 0.1 s)
     inference_interval_sec: Optional[float] = None  # optional wall-clock inference interval
-    use_async_inference: bool = True  # run model inference in background worker thread
+    use_async_inference: bool = False  # default: sync-wait mode (worker thread + blocking)
     num_npc_vehicles: int = 0     # number of NPC vehicles to spawn
     num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
 

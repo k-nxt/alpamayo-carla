@@ -123,8 +123,8 @@ def main():
         help="Run inference every N wall-clock seconds (overrides --inference-interval)",
     )
     parser.add_argument(
-        "--sync-inference", action="store_true",
-        help="Run inference synchronously on main thread (default: async worker)",
+        "--async-inference", action="store_true",
+        help="Run inference asynchronously (default is sync-wait mode)",
     )
     parser.add_argument(
         "--sim-fps", type=float, default=10.0,
@@ -302,7 +302,7 @@ def main():
         num_npc_walkers=args.npc_walkers,
         inference_interval=args.inference_interval,
         inference_interval_sec=args.inference_interval_sec,
-        use_async_inference=not args.sync_inference,
+        use_async_inference=args.async_inference,
         enable_display=not args.no_display,
         display_camera_downsample=max(1, args.display_cam_downsample),
         display_max_cameras=max(0, min(4, args.display_max_cameras)),
