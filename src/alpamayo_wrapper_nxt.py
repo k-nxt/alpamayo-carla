@@ -182,6 +182,7 @@ class AlpamayoWrapper:
         from .sensor_manager_nxt import ALPAMAYO_CAMERA_ORDER, ALPAMAYO_CAMERA_INDEX
 
         t_prep_start = time.perf_counter()
+        t0 = t_prep_start
         all_frames: List[torch.Tensor] = []
         for cam_name in ALPAMAYO_CAMERA_ORDER:
             for img_hwc in camera_frames[cam_name]:
@@ -189,6 +190,7 @@ class AlpamayoWrapper:
                 all_frames.append(t)
 
         image_tensor = torch.stack(all_frames, dim=0)
+        t1 = time.perf_counter()
 
         # Build chat messages (version-dependent)
         if self.is_v15:
@@ -211,6 +213,7 @@ class AlpamayoWrapper:
             messages = helper.create_message(image_tensor, **create_message_kwargs)
         else:
             messages = helper.create_message(image_tensor)
+        t2 = time.perf_counter()
 
         inputs = self.processor.apply_chat_template(
             messages,
@@ -220,6 +223,7 @@ class AlpamayoWrapper:
             return_dict=True,
             return_tensors="pt",
         )
+        t3 = time.perf_counter()
 
         model_inputs = {
             "tokenized_data": inputs,
@@ -280,12 +284,20 @@ class AlpamayoWrapper:
         t_end = time.perf_counter()
 
         if self.timing_log:
+            frame_tensor_ms = (t1 - t0) * 1000.0
+            message_ms = (t2 - t1) * 1000.0
+            chat_template_ms = (t3 - t2) * 1000.0
+            to_device_ms = (t_prep_end - t3) * 1000.0
             prep_ms = (t_prep_end - t_prep_start) * 1000.0
             model_ms = (t_model_end - t_model_start) * 1000.0
             post_ms = (t_end - t_model_end) * 1000.0
             total_ms = (t_end - t_start) * 1000.0
             print(
                 "[timing] "
+                f"frame_tensor={frame_tensor_ms:.1f}ms "
+                f"message={message_ms:.1f}ms "
+                f"chat_template={chat_template_ms:.1f}ms "
+                f"to_device={to_device_ms:.1f}ms "
                 f"prep={prep_ms:.1f}ms "
                 f"model={model_ms:.1f}ms "
                 f"post={post_ms:.1f}ms "

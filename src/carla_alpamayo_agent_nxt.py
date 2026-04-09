@@ -13,6 +13,7 @@ import carla
 import numpy as np
 import torch
 import time
+import threading
 from typing import Dict, Optional
 from dataclasses import dataclass
 from collections import deque
@@ -82,18 +83,39 @@ class AgentConfig:
     # Simulation
     sim_fps: float = 10.0         # 10 Hz = 0.1 s/tick, matching AR1 training data
     inference_interval: int = 1   # run inference every tick (= every 0.1 s)
+    inference_interval_sec: Optional[float] = None  # optional wall-clock inference interval
     num_npc_vehicles: int = 0     # number of NPC vehicles to spawn
     num_npc_walkers: int = 0      # number of NPC pedestrians to spawn
 
     # Control
+    control_mode: str = "legacy"      # "legacy" (TrajectoryFollower) or "official_pid"
     max_speed_kmh: float = 30.0
     min_speed_kmh: float = 0.0        # 0 = no minimum; >0 = floor for desired speed
     lookahead_distance: float = 5.0   # pure-pursuit look-ahead (m)
     steer_gain: float = 1.0           # steering multiplier (>1 = sharper turns)
     steer_normalize_deg: float = 70.0 # steering normalisation angle (deg)
+    # Official PID follower parameters (used when control_mode="official_pid")
+    pid_lookahead_min_m: float = 4.0
+    pid_lookahead_max_m: float = 12.0
+    pid_lookahead_speed_gain: float = 0.4
+    pid_target_speed_min_kmh: float = 10.0
+    pid_target_speed_max_kmh: float = 35.0
+    pid_target_speed_extent_gain: float = 0.5
+    pid_lat_kp: float = 1.1
+    pid_lat_ki: float = 0.02
+    pid_lat_kd: float = 0.15
+    pid_lon_kp: float = 0.6
+    pid_lon_ki: float = 0.05
+    pid_lon_kd: float = 0.0
+    pid_max_throttle: float = 0.35
+    pid_max_brake: float = 1.0
 
     # Display
     enable_display: bool = True       # pygame dashboard window
+    display_camera_downsample: int = 1  # display-only camera downsample factor
+    display_max_cameras: int = 4        # max camera panels to render
+    display_fetch_cameras: bool = True  # fetch camera frames for display path
+    loop_timing_log: bool = False       # print world/step/display loop timings
 
     # Video recording
     record_path: Optional[str] = None  # MP4 output path (None = no recording)
@@ -159,7 +181,7 @@ class TrajectoryFollower:
     # trajectory, apply a gentle "nudge" throttle to give the model
     # motion cues in its temporal frames.
     STANDSTILL_NUDGE_TICKS = 15
-    STANDSTILL_NUDGE_THROTTLE = 0.3
+    STANDSTILL_NUDGE_THROTTLE = 0.8
 
     def __init__(
         self,
@@ -192,7 +214,8 @@ class TrajectoryFollower:
         self._hdg_steer: float = 0.0           # heading component (for logging)
         self._explicit_stop: bool = False       # trajectory < 0.5m (for logging)
         self._last_control: Optional[carla.VehicleControl] = None  # for logging
-        self._standstill_ticks: int = 0        # consecutive ticks at ~0 speed
+        # Start in "stuck" state so NUDGE can trigger immediately after launch.
+        self._standstill_ticks: int = self.STANDSTILL_NUDGE_TICKS
         self._curve_safe_speed: float = 999.0  # curvature-based speed limit (for logging)
         self._smoothed_curve_safe: float = 999.0  # EMA-smoothed curve-safe speed
         self._short_traj_count: int = 0        # consecutive short-trajectory ticks
@@ -644,6 +667,234 @@ class TrajectoryFollower:
         return hdg_steer
 
 
+class OfficialPIDTrajectoryFollower:
+    """
+    CARLA official PID follower using Alpamayo trajectory as waypoint reference.
+
+    This mode intentionally keeps control logic simple and close to CARLA's
+    built-in VehiclePIDController behavior.
+    """
+
+    STANDSTILL_NUDGE_TICKS = 1_000_000
+    STANDSTILL_NUDGE_THROTTLE = 0.0
+
+    def __init__(
+        self,
+        world: carla.World,
+        vehicle: carla.Actor,
+        output_frequency_hz: float = 10.0,
+        max_speed_kmh: float = 30.0,
+        min_speed_kmh: float = 0.0,
+        lookahead_min_m: float = 4.0,
+        lookahead_max_m: float = 12.0,
+        lookahead_speed_gain: float = 0.4,
+        target_speed_min_kmh: float = 10.0,
+        target_speed_max_kmh: float = 35.0,
+        target_speed_extent_gain: float = 0.5,
+        lat_kp: float = 1.1,
+        lat_ki: float = 0.02,
+        lat_kd: float = 0.15,
+        lon_kp: float = 0.6,
+        lon_ki: float = 0.05,
+        lon_kd: float = 0.0,
+        max_throttle: float = 0.35,
+        max_brake: float = 1.0,
+    ):
+        from agents.navigation.controller import VehiclePIDController
+
+        self.world = world
+        self.map = world.get_map()
+        self.vehicle = vehicle
+
+        self.max_speed_ms = max_speed_kmh / 3.6
+        self.min_speed_ms = min_speed_kmh / 3.6
+        self._lookahead_min_m = lookahead_min_m
+        self._lookahead_max_m = lookahead_max_m
+        self._lookahead_speed_gain = lookahead_speed_gain
+        self._target_speed_min_kmh = target_speed_min_kmh
+        self._target_speed_max_kmh = target_speed_max_kmh
+        self._target_speed_extent_gain = target_speed_extent_gain
+
+        dt = 1.0 / max(output_frequency_hz, 1e-6)
+        self.pid = VehiclePIDController(
+            vehicle,
+            args_lateral={"K_P": lat_kp, "K_I": lat_ki, "K_D": lat_kd, "dt": dt},
+            args_longitudinal={"K_P": lon_kp, "K_I": lon_ki, "K_D": lon_kd, "dt": dt},
+            max_throttle=max_throttle,
+            max_brake=max_brake,
+            max_steering=0.8,
+        )
+
+        self.trajectory: Optional[np.ndarray] = None
+        self.headings: Optional[np.ndarray] = None
+        self._raw_desired_speed: float = 0.0
+        self._last_desired_speed: float = 0.0
+        self._last_steer: float = 0.0
+        self._raw_steer: float = 0.0
+        self._hdg_weight: float = 0.0
+        self._pp_steer: float = 0.0
+        self._hdg_steer: float = 0.0
+        self._explicit_stop: bool = False
+        self._last_control: Optional[carla.VehicleControl] = None
+        self._standstill_ticks: int = 0
+        self._curve_safe_speed: float = 999.0
+        self._short_traj_count: int = 0
+
+    def set_trajectory(self, trajectory_xy: np.ndarray, headings: np.ndarray) -> None:
+        self.trajectory = trajectory_xy
+        self.headings = headings
+
+    def _trajectory_length(self) -> float:
+        traj = self.trajectory
+        if traj is None or len(traj) < 2:
+            return 0.0
+        diffs = np.diff(traj, axis=0)
+        return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+    @staticmethod
+    def _alpamayo_to_carla_local(traj_xy: np.ndarray) -> np.ndarray:
+        wp = np.asarray(traj_xy, dtype=np.float64).copy()
+        wp[:, 1] *= -1.0  # rig y-left -> CARLA y-right
+        return wp
+
+    def _local_to_world(self, wp_local_xy: np.ndarray) -> np.ndarray:
+        tr = self.vehicle.get_transform()
+        wp_world = []
+        for p in wp_local_xy:
+            w = tr.transform(carla.Location(x=float(p[0]), y=float(p[1]), z=0.0))
+            wp_world.append([w.x, w.y, w.z])
+        return np.asarray(wp_world, dtype=np.float64)
+
+    def _pick_target_index(self, wp_world_xy: np.ndarray, speed_mps: float) -> int:
+        lookahead_m = float(np.clip(
+            self._lookahead_min_m + self._lookahead_speed_gain * speed_mps,
+            self._lookahead_min_m,
+            self._lookahead_max_m,
+        ))
+        if len(wp_world_xy) <= 1:
+            return 0
+        seg = np.linalg.norm(np.diff(wp_world_xy[:, :2], axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        return int(min(np.searchsorted(cum, lookahead_m), len(wp_world_xy) - 1))
+
+    def compute_control(self, current_speed_ms: float) -> carla.VehicleControl:
+        if self.trajectory is None or len(self.trajectory) == 0:
+            ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            self._last_control = ctrl
+            return ctrl
+
+        if current_speed_ms < 0.1:
+            self._standstill_ticks += 1
+        else:
+            self._standstill_ticks = 0
+
+        traj_local = self._alpamayo_to_carla_local(self.trajectory)
+        traj_world = self._local_to_world(traj_local)
+        target_idx = self._pick_target_index(traj_world, current_speed_ms)
+        target_loc = carla.Location(
+            x=float(traj_world[target_idx, 0]),
+            y=float(traj_world[target_idx, 1]),
+            z=float(traj_world[target_idx, 2]),
+        )
+        target_wp = self.map.get_waypoint(
+            target_loc, project_to_road=True, lane_type=carla.LaneType.Driving
+        )
+        if target_wp is None:
+            ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.3)
+            self._last_control = ctrl
+            return ctrl
+
+        traj_extent = float(np.max(np.linalg.norm(traj_local[:, :2], axis=1)))
+        target_speed_kmh = float(np.clip(
+            self._target_speed_min_kmh + self._target_speed_extent_gain * traj_extent,
+            self._target_speed_min_kmh,
+            self._target_speed_max_kmh,
+        ))
+        target_speed_kmh = min(target_speed_kmh, self.max_speed_ms * 3.6)
+
+        pid_ctrl = self.pid.run_step(target_speed_kmh, target_wp)
+        ctrl = carla.VehicleControl(
+            throttle=float(pid_ctrl.throttle),
+            steer=float(pid_ctrl.steer),
+            brake=float(pid_ctrl.brake),
+        )
+
+        self._raw_desired_speed = target_speed_kmh / 3.6
+        self._last_desired_speed = self._raw_desired_speed
+        self._raw_steer = ctrl.steer
+        self._last_steer = ctrl.steer
+        self._pp_steer = ctrl.steer
+        self._hdg_steer = 0.0
+        self._hdg_weight = 0.0
+        self._explicit_stop = self._trajectory_length() < 0.5
+        self._short_traj_count = 0
+        self._last_control = ctrl
+        return ctrl
+
+
+@dataclass
+class _InferenceRequest:
+    """Payload sent from main thread to inference worker."""
+    camera_frames: Dict[str, list]
+    ego_history_xyz: torch.Tensor
+    ego_history_rot: torch.Tensor
+    submit_tick: int
+    nav_text: Optional[str] = None
+
+
+@dataclass
+class _InferenceResult:
+    """Payload returned from worker thread to main thread."""
+    output: AlpamayoOutput
+    submit_tick: int
+    inference_time: float
+    nav_text: Optional[str] = None
+
+
+def _inference_worker(
+    model: AlpamayoWrapper,
+    config: AgentConfig,
+    request_event: threading.Event,
+    result_event: threading.Event,
+    shared: dict,
+    stop_event: threading.Event,
+) -> None:
+    """Background thread for Alpamayo inference."""
+    while not stop_event.is_set():
+        if not request_event.wait(timeout=0.1):
+            continue
+        request_event.clear()
+
+        req: Optional[_InferenceRequest] = shared.get("request")
+        if req is None:
+            continue
+
+        t0 = time.perf_counter()
+        if config.use_dummy_model:
+            output = model.predict_dummy()
+        else:
+            output = model.predict(
+                camera_frames=req.camera_frames,
+                ego_history_xyz=req.ego_history_xyz,
+                ego_history_rot=req.ego_history_rot,
+                max_generation_length=config.max_generation_length,
+                diffusion_steps=config.diffusion_steps,
+                nav_text=req.nav_text,
+                use_cfg_nav=config.use_cfg_nav,
+                cfg_nav_guidance_weight=config.cfg_nav_guidance_weight,
+                use_camera_indices=config.use_camera_indices,
+            )
+        elapsed = time.perf_counter() - t0
+
+        shared["result"] = _InferenceResult(
+            output=output,
+            submit_tick=req.submit_tick,
+            inference_time=elapsed,
+            nav_text=req.nav_text,
+        )
+        result_event.set()
+
+
 # ---------------------------------------------------------------------------
 # Main agent
 # ---------------------------------------------------------------------------
@@ -670,7 +921,7 @@ class CarlaAlpamayoAgent:
         # Sub-components
         self.sensor_manager: Optional[SensorManager] = None
         self.alpamayo: Optional[AlpamayoWrapper] = None
-        self.follower: Optional[TrajectoryFollower] = None
+        self.follower: Optional[object] = None
         self.display: Optional[Display] = None
         self.traj_optimizer: Optional[TrajectoryOptimizer] = None
         self.nav_planner = None  # NavPlanner (Alpamayo 1.5 only)
@@ -684,6 +935,9 @@ class CarlaAlpamayoAgent:
         self.tick_count = 0
         self.last_output: Optional[AlpamayoOutput] = None
         self.last_inference_time: float = 0.0  # seconds (wall clock)
+        self.last_result_tick: int = 0
+        self.inference_busy: bool = False
+        self._last_inference_submit_wall_time: float = -1e9
         self.last_opt_result: Optional[OptimizationResult] = None
         self.last_nav_text: Optional[str] = None
         self._debug_log_file = None
@@ -691,6 +945,13 @@ class CarlaAlpamayoAgent:
         self._npc_vehicles: list = []
         self._npc_walkers: list = []       # walker actors
         self._npc_walker_ctrls: list = []  # AI controller actors
+
+        # Inference threading (same pattern as observer)
+        self._request_event = threading.Event()
+        self._result_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._shared: dict = {}
+        self._worker_thread: Optional[threading.Thread] = None
 
     # ==================================================================
     # Initialisation helpers
@@ -971,13 +1232,39 @@ class CarlaAlpamayoAgent:
         self.setup_sensors()
         self.load_alpamayo()
 
-        self.follower = TrajectoryFollower(
-            lookahead_distance=self.config.lookahead_distance,
-            max_speed_kmh=self.config.max_speed_kmh,
-            min_speed_kmh=self.config.min_speed_kmh,
-            steer_gain=self.config.steer_gain,
-            steer_normalize_deg=self.config.steer_normalize_deg,
-        )
+        control_mode = self.config.control_mode.replace("-", "_").lower()
+        if control_mode == "official_pid":
+            self.follower = OfficialPIDTrajectoryFollower(
+                world=self.world,
+                vehicle=self.vehicle,
+                output_frequency_hz=self.config.sim_fps,
+                max_speed_kmh=self.config.max_speed_kmh,
+                min_speed_kmh=self.config.min_speed_kmh,
+                lookahead_min_m=self.config.pid_lookahead_min_m,
+                lookahead_max_m=self.config.pid_lookahead_max_m,
+                lookahead_speed_gain=self.config.pid_lookahead_speed_gain,
+                target_speed_min_kmh=self.config.pid_target_speed_min_kmh,
+                target_speed_max_kmh=self.config.pid_target_speed_max_kmh,
+                target_speed_extent_gain=self.config.pid_target_speed_extent_gain,
+                lat_kp=self.config.pid_lat_kp,
+                lat_ki=self.config.pid_lat_ki,
+                lat_kd=self.config.pid_lat_kd,
+                lon_kp=self.config.pid_lon_kp,
+                lon_ki=self.config.pid_lon_ki,
+                lon_kd=self.config.pid_lon_kd,
+                max_throttle=self.config.pid_max_throttle,
+                max_brake=self.config.pid_max_brake,
+            )
+            print("Control mode: official_pid (CARLA VehiclePIDController)")
+        else:
+            self.follower = TrajectoryFollower(
+                lookahead_distance=self.config.lookahead_distance,
+                max_speed_kmh=self.config.max_speed_kmh,
+                min_speed_kmh=self.config.min_speed_kmh,
+                steer_gain=self.config.steer_gain,
+                steer_normalize_deg=self.config.steer_normalize_deg,
+            )
+            print("Control mode: legacy (TrajectoryFollower)")
 
         # Trajectory optimiser (optional post-processing)
         if self.config.traj_opt_enabled:
@@ -1023,12 +1310,34 @@ class CarlaAlpamayoAgent:
                 self.nav_planner.set_random_destination(start)
             print("Navigation planner enabled (Alpamayo 1.5)")
 
+        # Start inference worker thread
+        self._stop_event.clear()
+        self._request_event.clear()
+        self._result_event.clear()
+        self._shared.clear()
+        self.inference_busy = False
+        self._worker_thread = threading.Thread(
+            target=_inference_worker,
+            args=(
+                self.alpamayo,
+                self.config,
+                self._request_event,
+                self._result_event,
+                self._shared,
+                self._stop_event,
+            ),
+            daemon=True,
+        )
+        self._worker_thread.start()
+
         # Pygame display (optional)
         if self.config.enable_display:
             self.display = Display(
                 record_path=self.config.record_path,
                 record_fps=self.config.sim_fps,
                 record_crf=self.config.record_crf,
+                camera_downsample=self.config.display_camera_downsample,
+                max_cameras=self.config.display_max_cameras,
             )
 
         print("Agent initialised successfully!")
@@ -1199,70 +1508,82 @@ class CarlaAlpamayoAgent:
             self.nav_planner.set_random_destination(self.vehicle.get_location())
         return nav_text
 
+    def _should_run_inference(self) -> bool:
+        """Check whether we should run inference this tick."""
+        sec_interval = self.config.inference_interval_sec
+        if sec_interval is not None and sec_interval > 0.0:
+            now = time.monotonic()
+            return (now - self._last_inference_submit_wall_time) >= sec_interval
+        return (self.tick_count % self.config.inference_interval) == 0
+
+    def _apply_inference_result(self, output: AlpamayoOutput) -> None:
+        """Apply inference result to active trajectory/control state."""
+        self.last_output = output
+
+        # ── Trajectory optimisation (optional) ──
+        traj_xy = output.trajectory_xy
+        headings = output.headings
+
+        if (
+            self.traj_optimizer is not None
+            and traj_xy is not None
+            and len(traj_xy) >= 2
+        ):
+            traj_xyh = add_heading_to_trajectory(traj_xy)
+            opt_result = self.traj_optimizer.optimize(
+                trajectory=traj_xyh,
+                time_step=1.0 / 10.0,  # AR1 output at 10 Hz
+                retime_in_frenet=self.config.traj_opt_retime,
+                retime_alpha=self.config.traj_opt_retime_alpha,
+            )
+            self.last_opt_result = opt_result
+            if opt_result.success:
+                traj_xy = opt_result.trajectory[:, :2]
+                headings = opt_result.trajectory[:, 2]
+        else:
+            self.last_opt_result = None
+
+        self.follower.set_trajectory(traj_xy, headings)
+        self.inference_count += 1
+
     def step(self) -> Optional[AlpamayoOutput]:
         """Execute one simulation tick; optionally run inference."""
         self._record_ego_pose()
         state = self.get_vehicle_state()
         self.tick_count += 1
 
-        # --- periodic inference ---
-        if self.tick_count % self.config.inference_interval == 0:
+        # --- consume completed inference result ---
+        if self._result_event.is_set():
+            self._result_event.clear()
+            result: Optional[_InferenceResult] = self._shared.get("result")
+            if result is not None:
+                self.last_inference_time = result.inference_time
+                self.last_result_tick = result.submit_tick
+                self.last_nav_text = result.nav_text
+                self.inference_busy = False
+                self._apply_inference_result(result.output)
+
+        # --- submit inference request if idle ---
+        if not self.inference_busy and self._should_run_inference():
             cam_frames = self._prepare_camera_frames()
             hist = self._build_ego_history_tensors()
-
             if cam_frames is not None and hist is not None:
                 ego_xyz, ego_rot = hist
-
-                # Navigation instruction (Alpamayo 1.5 only)
                 nav_text = self.config.nav_text_override
                 if nav_text is None:
                     nav_text = self._get_nav_text()
+
+                self._shared["request"] = _InferenceRequest(
+                    camera_frames=cam_frames,
+                    ego_history_xyz=ego_xyz,
+                    ego_history_rot=ego_rot,
+                    submit_tick=self.tick_count,
+                    nav_text=nav_text,
+                )
+                self._request_event.set()
+                self.inference_busy = True
                 self.last_nav_text = nav_text
-
-                t0 = time.perf_counter()
-                if self.config.use_dummy_model:
-                    output = self.alpamayo.predict_dummy()
-                else:
-                    output = self.alpamayo.predict(
-                        camera_frames=cam_frames,
-                        ego_history_xyz=ego_xyz,
-                        ego_history_rot=ego_rot,
-                        max_generation_length=self.config.max_generation_length,
-                        diffusion_steps=self.config.diffusion_steps,
-                        nav_text=nav_text,
-                        use_cfg_nav=self.config.use_cfg_nav,
-                        cfg_nav_guidance_weight=self.config.cfg_nav_guidance_weight,
-                        use_camera_indices=self.config.use_camera_indices,
-                    )
-                self.last_inference_time = time.perf_counter() - t0
-
-                self.last_output = output
-
-                # ── Trajectory optimisation (optional) ──
-                traj_xy = output.trajectory_xy
-                headings = output.headings
-
-                if (
-                    self.traj_optimizer is not None
-                    and traj_xy is not None
-                    and len(traj_xy) >= 2
-                ):
-                    traj_xyh = add_heading_to_trajectory(traj_xy)
-                    opt_result = self.traj_optimizer.optimize(
-                        trajectory=traj_xyh,
-                        time_step=1.0 / 10.0,  # AR1 output at 10 Hz
-                        retime_in_frenet=self.config.traj_opt_retime,
-                        retime_alpha=self.config.traj_opt_retime_alpha,
-                    )
-                    self.last_opt_result = opt_result
-                    if opt_result.success:
-                        traj_xy = opt_result.trajectory[:, :2]
-                        headings = opt_result.trajectory[:, 2]
-                else:
-                    self.last_opt_result = None
-
-                self.follower.set_trajectory(traj_xy, headings)
-                self.inference_count += 1
+                self._last_inference_submit_wall_time = time.monotonic()
 
         # --- control ---
         control = self.follower.compute_control(state["speed_ms"])
@@ -1300,8 +1621,13 @@ class CarlaAlpamayoAgent:
             verbose: Print periodic status lines.
         """
         cfg = self.config
-        infer_hz = cfg.sim_fps / cfg.inference_interval
-        print(f"Starting autonomous driving  (inference ≈{infer_hz:.1f} Hz)")
+        if cfg.inference_interval_sec is not None and cfg.inference_interval_sec > 0.0:
+            infer_hz = 1.0 / cfg.inference_interval_sec
+            infer_mode = f"time-based {cfg.inference_interval_sec:.2f}s"
+        else:
+            infer_hz = cfg.sim_fps / cfg.inference_interval
+            infer_mode = f"tick-based every {cfg.inference_interval} tick(s)"
+        print(f"Starting autonomous driving  (inference ≈{infer_hz:.1f} Hz, {infer_mode})")
         print("Press Ctrl+C to stop\n")
 
         # --- warm-up: collect enough sensor data & ego history ---
@@ -1358,13 +1684,31 @@ class CarlaAlpamayoAgent:
 
         try:
             while self.is_running and self.inference_count < max_frames:
+                loop_t0 = time.perf_counter()
+                t0 = time.perf_counter()
                 self.world.tick()
+                world_tick_ms = (time.perf_counter() - t0) * 1000.0
+
+                t0 = time.perf_counter()
                 output = self.step()
+                step_ms = (time.perf_counter() - t0) * 1000.0
+
+                t0 = time.perf_counter()
                 self.update_spectator()
+                spectator_ms = (time.perf_counter() - t0) * 1000.0
 
                 # ── pygame display ──
+                display_ms = 0.0
+                display_fetch_ms = 0.0
+                display_render_ms = 0.0
                 if self.display is not None:
+                    t0 = time.perf_counter()
                     state = self.get_vehicle_state()
+                    cam_images = None
+                    if cfg.display_fetch_cameras:
+                        tf = time.perf_counter()
+                        cam_images = self._get_latest_camera_images()
+                        display_fetch_ms = (time.perf_counter() - tf) * 1000.0
                     # The follower holds the (possibly optimised) trajectory
                     active_traj = self.follower.trajectory
                     # Raw model output for comparison
@@ -1373,8 +1717,9 @@ class CarlaAlpamayoAgent:
                     meta_act = output.meta_action if output else None
                     all_traj = output.all_trajectories_xy if output else None
                     sel_idx = output.selected_index if output else 0
+                    tr = time.perf_counter()
                     self.display.tick(
-                        camera_images=self._get_latest_camera_images(),
+                        camera_images=cam_images,
                         vehicle_state=state,
                         trajectory_xy=active_traj,
                         reasoning=reasoning,
@@ -1387,9 +1732,23 @@ class CarlaAlpamayoAgent:
                         nav_text=self.last_nav_text,
                         meta_action=meta_act,
                     )
+                    display_render_ms = (time.perf_counter() - tr) * 1000.0
                     if self.display.should_quit:
                         print("Display closed – stopping.")
                         break
+                    display_ms = (time.perf_counter() - t0) * 1000.0
+                loop_ms = (time.perf_counter() - loop_t0) * 1000.0
+                if cfg.loop_timing_log:
+                    print(
+                        "[loop_timing] "
+                        f"world_tick={world_tick_ms:.1f}ms "
+                        f"step={step_ms:.1f}ms "
+                        f"spectator={spectator_ms:.1f}ms "
+                        f"display={display_ms:.1f}ms "
+                        f"display_fetch={display_fetch_ms:.1f}ms "
+                        f"display_render={display_render_ms:.1f}ms "
+                        f"loop_total={loop_ms:.1f}ms"
+                    )
 
                 # ── console log ──
                 if verbose:
@@ -1493,6 +1852,11 @@ class CarlaAlpamayoAgent:
 
     def cleanup(self) -> None:
         print("Cleaning up…")
+        self._stop_event.set()
+        self._request_event.set()
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=2.0)
+            self._worker_thread = None
         self._destroy_npc_traffic()
         if self._debug_log_file:
             self._debug_log_file.close()

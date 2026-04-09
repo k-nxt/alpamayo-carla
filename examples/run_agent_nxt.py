@@ -54,7 +54,7 @@ def main():
         help="Spawn point index (-1 = random, 0..N = fixed index)",
     )
     parser.add_argument(
-        "--vehicle", default="vehicle.mercedes.coupe_2020",
+        "--vehicle", default="vehicle.tesla.model3",
         help="Vehicle blueprint filter (e.g. vehicle.mercedes.coupe_2020, vehicle.lincoln.mkz_2020)",
     )
     parser.add_argument(
@@ -111,12 +111,24 @@ def main():
         help="Print per-inference timing breakdown (prep/model/post/total)",
     )
     parser.add_argument(
+        "--loop-timing-log", action="store_true",
+        help="Print per-loop timing breakdown (world tick/step/display/total)",
+    )
+    parser.add_argument(
         "--inference-interval", type=int, default=1,
         help="Run inference every N simulation ticks (default 1 → every tick)",
     )
     parser.add_argument(
+        "--inference-interval-sec", type=float, default=None,
+        help="Run inference every N wall-clock seconds (overrides --inference-interval)",
+    )
+    parser.add_argument(
         "--sim-fps", type=float, default=10.0,
         help="Simulation FPS (default 10.0 = 0.1s/tick, matching AR1 training)",
+    )
+    parser.add_argument(
+        "--control-mode", type=str, default="legacy", choices=["legacy", "official-pid"],
+        help="Control mode: legacy follower or CARLA official PID follower",
     )
     parser.add_argument(
         "--npc-vehicles", type=int, default=0, metavar="N",
@@ -129,6 +141,18 @@ def main():
     parser.add_argument(
         "--no-display", action="store_true",
         help="Disable pygame dashboard window",
+    )
+    parser.add_argument(
+        "--display-cam-downsample", type=int, default=1, metavar="N",
+        help="Display-only camera downsample factor (1=no downsample, 2=half in each axis, ...)",
+    )
+    parser.add_argument(
+        "--display-max-cameras", type=int, default=4, metavar="N",
+        help="Maximum number of camera panels to render in display (0-4)",
+    )
+    parser.add_argument(
+        "--display-no-camera-fetch", action="store_true",
+        help="Do not fetch camera images for display (HUD/BEV text only)",
     )
     parser.add_argument(
         "--record", type=str, default=None, metavar="PATH",
@@ -202,6 +226,44 @@ def main():
         "--retime-alpha", type=float, default=0.25,
         help="Retiming strength [0..1] (default 0.25)",
     )
+    parser.add_argument(
+        "--pid-lookahead-min", type=float, default=4.0,
+        help="Official PID: minimum lookahead distance [m]",
+    )
+    parser.add_argument(
+        "--pid-lookahead-max", type=float, default=12.0,
+        help="Official PID: maximum lookahead distance [m]",
+    )
+    parser.add_argument(
+        "--pid-lookahead-speed-gain", type=float, default=0.4,
+        help="Official PID: lookahead increase per speed [m/(m/s)]",
+    )
+    parser.add_argument(
+        "--pid-target-speed-min", type=float, default=10.0,
+        help="Official PID: minimum target speed [km/h]",
+    )
+    parser.add_argument(
+        "--pid-target-speed-max", type=float, default=35.0,
+        help="Official PID: maximum target speed [km/h]",
+    )
+    parser.add_argument(
+        "--pid-target-speed-extent-gain", type=float, default=0.5,
+        help="Official PID: target speed gain from trajectory extent",
+    )
+    parser.add_argument("--pid-lat-kp", type=float, default=1.1, help="Official PID lateral Kp")
+    parser.add_argument("--pid-lat-ki", type=float, default=0.02, help="Official PID lateral Ki")
+    parser.add_argument("--pid-lat-kd", type=float, default=0.15, help="Official PID lateral Kd")
+    parser.add_argument("--pid-lon-kp", type=float, default=0.6, help="Official PID longitudinal Kp")
+    parser.add_argument("--pid-lon-ki", type=float, default=0.05, help="Official PID longitudinal Ki")
+    parser.add_argument("--pid-lon-kd", type=float, default=0.0, help="Official PID longitudinal Kd")
+    parser.add_argument(
+        "--pid-max-throttle", type=float, default=0.35,
+        help="Official PID max throttle",
+    )
+    parser.add_argument(
+        "--pid-max-brake", type=float, default=1.0,
+        help="Official PID max brake",
+    )
     args = parser.parse_args()
 
     # Recording requires the display to be enabled
@@ -220,6 +282,7 @@ def main():
         model_name=args.model,
         max_speed_kmh=args.max_speed,
         min_speed_kmh=args.min_speed,
+        control_mode=args.control_mode.replace("-", "_"),
         steer_gain=args.steer_gain,
         steer_normalize_deg=args.steer_norm_deg,
         num_traj_samples=args.num_traj_samples,
@@ -229,11 +292,16 @@ def main():
         vlm_temperature=args.temperature,
         vlm_top_p=args.top_p,
         timing_log=args.timing_log,
+        loop_timing_log=args.loop_timing_log,
         sim_fps=args.sim_fps,
         num_npc_vehicles=args.npc_vehicles,
         num_npc_walkers=args.npc_walkers,
         inference_interval=args.inference_interval,
+        inference_interval_sec=args.inference_interval_sec,
         enable_display=not args.no_display,
+        display_camera_downsample=max(1, args.display_cam_downsample),
+        display_max_cameras=max(0, min(4, args.display_max_cameras)),
+        display_fetch_cameras=not args.display_no_camera_fetch,
         record_path=args.record,
         record_crf=args.crf,
         nav_enabled=not args.no_nav,
@@ -250,6 +318,20 @@ def main():
         traj_opt_max_iter=args.traj_opt_iter,
         traj_opt_retime=not args.no_retime,
         traj_opt_retime_alpha=args.retime_alpha,
+        pid_lookahead_min_m=args.pid_lookahead_min,
+        pid_lookahead_max_m=args.pid_lookahead_max,
+        pid_lookahead_speed_gain=args.pid_lookahead_speed_gain,
+        pid_target_speed_min_kmh=args.pid_target_speed_min,
+        pid_target_speed_max_kmh=args.pid_target_speed_max,
+        pid_target_speed_extent_gain=args.pid_target_speed_extent_gain,
+        pid_lat_kp=args.pid_lat_kp,
+        pid_lat_ki=args.pid_lat_ki,
+        pid_lat_kd=args.pid_lat_kd,
+        pid_lon_kp=args.pid_lon_kp,
+        pid_lon_ki=args.pid_lon_ki,
+        pid_lon_kd=args.pid_lon_kd,
+        pid_max_throttle=args.pid_max_throttle,
+        pid_max_brake=args.pid_max_brake,
     )
 
     with CarlaAlpamayoAgent(config) as agent:

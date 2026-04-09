@@ -64,7 +64,7 @@ class ObserverConfig:
     weather: str = "ClearNoon"
 
     # Vehicle
-    vehicle_filter: str = "vehicle.mercedes.coupe_2020"
+    vehicle_filter: str = "vehicle.tesla.model3"
     spawn_point_index: int = -1   # -1 = random
 
     # Autopilot

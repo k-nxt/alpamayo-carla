@@ -75,59 +75,29 @@ class SensorManager:
     incoming frames with timestamps.
     """
 
-    # -- Camera configs matching Alpamayo's training rig ----------------
-    # Positions derived from the NVIDIA Hyperion rig extrinsics:
-    #
-    #   Rig frame (origin = rear axle): X forward, Y left, Z up
-    #     front_wide : [1.670, -0.026, 1.523]
-    #     front_tele : co-located with front_wide (same mount, different lens)
-    #     cross_left : [1.646,  0.143, 1.521]
-    #     cross_right: [1.626, -0.162, 1.526]
-    #
-    #   CARLA frame: X forward, Y right, Z up.
-    #   CARLA's vehicle origin is at the bounding-box center, which is
-    #   ~1.389 m ahead of the rear axle (from CARLA_REAR_AXLE constant).
-    #   Conversion:
-    #       x_carla = x_rig − 1.389
-    #       y_carla = −y_rig    (Y axis inversion)
-    #       z_carla = z_rig + _Z_CLEARANCE
-    #
-    #   _Z_CLEARANCE raises cameras above the CARLA vehicle mesh so that
-    #   the roof, A-pillars, and windshield frame do not occlude the view.
-    #   The real cameras are mounted on top of the roof; in CARLA we need
-    #   a small extra margin because the mesh geometry varies per vehicle.
-    #
-    #   Note: raw camera images from the real vehicle are undistorted
-    #   (rectified) before model input, so CARLA's pinhole (rectilinear)
-    #   output is the correct format — no barrel distortion is expected.
-    #
-    #   Cross-camera yaw angles computed from rig_to_camera quaternions:
-    #     cross_left  ≈ −55° (looking left)
-    #     cross_right ≈ +55° (looking right)
+    # -- Camera configs aligned with "other/Alpamayo-CARLA" closed-loop rig --
+    # CARLA frame: X forward, Y right, Z up.
+    # These values are intentionally set to match the external reference
+    # implementation (Tesla-focused setup) for A/B comparisons.
     # -----------------------------------------------------------------
-
-    # CARLA rear-axle offset (from alpasim's transfuser_impl.py)
-    _REAR_AXLE_X = -1.389   # rear axle is 1.389 m behind vehicle center
-    # Extra Z lift to clear CARLA vehicle roof meshes
-    _Z_CLEARANCE = 0.15
 
     CAMERA_CONFIGS = {
         "camera_front_wide_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
+                carla.Location(x=1.5, y=0.0, z=2.4),
                 carla.Rotation(pitch=0),
             ),
             attributes={
                 "image_size_x": _CAM_W,
                 "image_size_y": _CAM_H,
-                "fov": "120",
+                "fov": "95",
             },
         ),
         "camera_front_tele_30fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
+                carla.Location(x=1.5, y=0.0, z=2.4),
                 carla.Rotation(pitch=0),
             ),
             attributes={
@@ -139,8 +109,8 @@ class SensorManager:
         "camera_cross_left_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.646 + _REAR_AXLE_X, y=-0.143, z=1.521 + _Z_CLEARANCE),
-                carla.Rotation(yaw=-55),
+                carla.Location(x=1.0, y=-0.5, z=2.4),
+                carla.Rotation(yaw=-60),
             ),
             attributes={
                 "image_size_x": _CAM_W,
@@ -151,8 +121,8 @@ class SensorManager:
         "camera_cross_right_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.626 + _REAR_AXLE_X, y=0.162, z=1.526 + _Z_CLEARANCE),
-                carla.Rotation(yaw=55),
+                carla.Location(x=1.0, y=0.5, z=2.4),
+                carla.Rotation(yaw=60),
             ),
             attributes={
                 "image_size_x": _CAM_W,

@@ -60,7 +60,7 @@ def main():
         help="Spawn point index (-1 = random)",
     )
     parser.add_argument(
-        "--vehicle", default="vehicle.mercedes.coupe_2020",
+        "--vehicle", default="vehicle.tesla.model3",
         help="Vehicle blueprint filter",
     )
     parser.add_argument(

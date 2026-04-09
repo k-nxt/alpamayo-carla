@@ -87,6 +87,8 @@ class Display:
         record_path: Optional[str] = None,
         record_fps: float = 10.0,
         record_crf: int = 23,
+        camera_downsample: int = 1,
+        max_cameras: int = 4,
     ):
         """
         Args:
@@ -97,6 +99,9 @@ class Display:
                 Set this to ``sim_fps`` so the video runs at real-time.
             record_crf: H.264 CRF value (0 = lossless, 23 = default,
                 51 = worst).  Lower → better quality / larger file.
+            camera_downsample: Optional integer downsample factor applied to
+                camera images before creating pygame surfaces.
+            max_cameras: Max number of camera panels to actively render.
         """
         if pygame is None:
             raise ImportError(
@@ -117,6 +122,8 @@ class Display:
         self.should_quit = False
         self._frame_times: List[float] = []
         self._sim_fps = max(float(record_fps), 1e-6)
+        self._camera_downsample = max(1, int(camera_downsample))
+        self._max_cameras = max(0, min(4, int(max_cameras)))
 
         # ── Video recording ──
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
@@ -306,8 +313,12 @@ class Display:
             self.screen.blit(lbl_surf, (x + 4, y + 2))
 
             # Image
-            if images and cam_key in images:
+            if i < self._max_cameras and images and cam_key in images:
                 img = images[cam_key]
+                if self._camera_downsample > 1:
+                    img = np.ascontiguousarray(
+                        img[::self._camera_downsample, ::self._camera_downsample]
+                    )
                 surf = pygame.surfarray.make_surface(img.swapaxes(0, 1))
                 surf = pygame.transform.scale(surf, (_CAM_W, _CAM_H))
                 self.screen.blit(surf, (x, y + _CAM_LABEL_H))
