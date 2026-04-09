@@ -75,6 +75,11 @@ class SensorManager:
     incoming frames with timestamps.
     """
 
+    # CARLA rear-axle offset (from alpasim's transfuser_impl.py)
+    _REAR_AXLE_X = -0.0   # rear axle is 1.389 m behind vehicle center
+    # Extra Z lift to clear CARLA vehicle roof meshes
+    _Z_CLEARANCE = 0
+    
     # -- Camera configs aligned with "other/Alpamayo-CARLA" closed-loop rig --
     # CARLA frame: X forward, Y right, Z up.
     # These values are intentionally set to match the external reference
@@ -85,19 +90,22 @@ class SensorManager:
         "camera_front_wide_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.5, y=0.0, z=2.4),
+                #carla.Location(x=1.5, y=0.0, z=2.4),
+                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
                 carla.Rotation(pitch=0),
             ),
             attributes={
                 "image_size_x": _CAM_W,
                 "image_size_y": _CAM_H,
-                "fov": "95",
+                #"fov": "95",
+                "fov": "120",
             },
         ),
         "camera_front_tele_30fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.5, y=0.0, z=2.4),
+                #carla.Location(x=1.5, y=0.0, z=2.4),
+                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
                 carla.Rotation(pitch=0),
             ),
             attributes={
@@ -109,8 +117,10 @@ class SensorManager:
         "camera_cross_left_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.0, y=-0.5, z=2.4),
-                carla.Rotation(yaw=-60),
+                #carla.Location(x=1.0, y=-0.5, z=2.4),
+                #carla.Rotation(yaw=-60),
+                carla.Location(x=1.646 + _REAR_AXLE_X, y=-0.143, z=1.521 + _Z_CLEARANCE),
+                carla.Rotation(yaw=-55),                
             ),
             attributes={
                 "image_size_x": _CAM_W,
@@ -121,8 +131,10 @@ class SensorManager:
         "camera_cross_right_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                carla.Location(x=1.0, y=0.5, z=2.4),
-                carla.Rotation(yaw=60),
+               carla.Location(x=1.626 + _REAR_AXLE_X, y=0.162, z=1.526 + _Z_CLEARANCE),
+                carla.Rotation(yaw=55),
+                #carla.Location(x=1.0, y=0.5, z=2.4),
+                #carla.Rotation(yaw=60),
             ),
             attributes={
                 "image_size_x": _CAM_W,
