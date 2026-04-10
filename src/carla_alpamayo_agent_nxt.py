@@ -1990,7 +1990,9 @@ class CarlaAlpamayoAgent:
         self._stop_event.set()
         self._request_event.set()
         if self._worker_thread is not None:
-            self._worker_thread.join(timeout=2.0)
+            self._worker_thread.join(timeout=10.0)
+            if self._worker_thread.is_alive():
+                print("Warning: inference worker did not exit within timeout.")
             self._worker_thread = None
         self._destroy_npc_traffic()
         if self._debug_log_file:

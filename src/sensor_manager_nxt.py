@@ -75,11 +75,6 @@ class SensorManager:
     incoming frames with timestamps.
     """
 
-    # CARLA rear-axle offset (from alpasim's transfuser_impl.py)
-    _REAR_AXLE_X = -0.0   # rear axle is 1.389 m behind vehicle center
-    # Extra Z lift to clear CARLA vehicle roof meshes
-    _Z_CLEARANCE = 0
-    
     # -- Camera configs aligned with "other/Alpamayo-CARLA" closed-loop rig --
     # CARLA frame: X forward, Y right, Z up.
     # These values are intentionally set to match the external reference
@@ -90,22 +85,19 @@ class SensorManager:
         "camera_front_wide_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                #carla.Location(x=1.5, y=0.0, z=2.4),
-                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
+                carla.Location(x=1.5, y=0.0, z=2.4),
                 carla.Rotation(pitch=0),
             ),
             attributes={
                 "image_size_x": _CAM_W,
                 "image_size_y": _CAM_H,
-                #"fov": "95",
-                "fov": "120",
+                "fov": "95",
             },
         ),
         "camera_front_tele_30fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                #carla.Location(x=1.5, y=0.0, z=2.4),
-                carla.Location(x=1.670 + _REAR_AXLE_X, y=0.026, z=1.523 + _Z_CLEARANCE),
+                carla.Location(x=1.5, y=0.0, z=2.4),
                 carla.Rotation(pitch=0),
             ),
             attributes={
@@ -117,10 +109,9 @@ class SensorManager:
         "camera_cross_left_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-                #carla.Location(x=1.0, y=-0.5, z=2.4),
+                carla.Location(x=1.0, y=-0.5, z=2.4),
                 #carla.Rotation(yaw=-60),
-                carla.Location(x=1.646 + _REAR_AXLE_X, y=-0.143, z=1.521 + _Z_CLEARANCE),
-                carla.Rotation(yaw=-55),                
+                carla.Rotation(yaw=-55),
             ),
             attributes={
                 "image_size_x": _CAM_W,
@@ -131,10 +122,8 @@ class SensorManager:
         "camera_cross_right_120fov": SensorConfig(
             sensor_type="sensor.camera.rgb",
             transform=carla.Transform(
-               carla.Location(x=1.626 + _REAR_AXLE_X, y=0.162, z=1.526 + _Z_CLEARANCE),
-                carla.Rotation(yaw=55),
-                #carla.Location(x=1.0, y=0.5, z=2.4),
-                #carla.Rotation(yaw=60),
+                carla.Location(x=1.0, y=0.5, z=2.4),
+                carla.Rotation(yaw=60),
             ),
             attributes={
                 "image_size_x": _CAM_W,
@@ -215,6 +204,7 @@ class SensorManager:
         # Per-camera ring buffers for temporal context
         self.frame_buffer_size = frame_buffer_size
         self.frame_buffers: Dict[str, deque] = {}
+        self._shutting_down: bool = False
 
     # ------------------------------------------------------------------
     # Sensor lifecycle
@@ -248,6 +238,7 @@ class SensorManager:
         if "camera.rgb" in config.sensor_type:
             self.frame_buffers[name] = deque(maxlen=self.frame_buffer_size)
 
+        self._shutting_down = False
         sensor.listen(lambda data, n=name: self._on_sensor_data(n, data))
         self.sensors[name] = sensor
         print(f"Spawned sensor: {name} ({config.sensor_type})")
@@ -263,11 +254,16 @@ class SensorManager:
 
     def destroy_all(self) -> None:
         """Destroy all sensors and clear buffers."""
-        for name, sensor in self.sensors.items():
-            if sensor.is_alive:
-                sensor.stop()
-                sensor.destroy()
-                print(f"Destroyed sensor: {name}")
+        self._shutting_down = True
+        for name, sensor in list(self.sensors.items()):
+            try:
+                if sensor.is_alive:
+                    sensor.stop()
+                    sensor.destroy()
+                    print(f"Destroyed sensor: {name}")
+            except RuntimeError:
+                # Sensor may already be gone; continue best-effort cleanup.
+                pass
         self.sensors.clear()
         self.data_queues.clear()
         self.latest_data.clear()
@@ -279,24 +275,32 @@ class SensorManager:
 
     def _on_sensor_data(self, name: str, data: object) -> None:
         """Callback invoked by CARLA on each sensor tick."""
-        self.latest_data[name] = data
-
-        # Append to frame buffer for camera sensors
-        if name in self.frame_buffers:
-            image = self._process_camera_image(data)
-            timestamp_us = int(data.timestamp * 1_000_000)
-            self.frame_buffers[name].append(
-                TimestampedFrame(timestamp_us=timestamp_us, image=image)
-            )
-
+        if self._shutting_down:
+            return
         try:
-            self.data_queues[name].put_nowait(data)
-        except queue.Full:
+            self.latest_data[name] = data
+
+            # Append to frame buffer for camera sensors
+            fb = self.frame_buffers.get(name)
+            if fb is not None:
+                image = self._process_camera_image(data)
+                timestamp_us = int(data.timestamp * 1_000_000)
+                fb.append(TimestampedFrame(timestamp_us=timestamp_us, image=image))
+
+            q = self.data_queues.get(name)
+            if q is None:
+                return
             try:
-                self.data_queues[name].get_nowait()
-                self.data_queues[name].put_nowait(data)
-            except queue.Empty:
-                pass
+                q.put_nowait(data)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(data)
+                except queue.Empty:
+                    pass
+        except Exception:
+            # Never propagate callback exceptions into CARLA's sensor thread.
+            return
 
     # ------------------------------------------------------------------
     # Data retrieval
