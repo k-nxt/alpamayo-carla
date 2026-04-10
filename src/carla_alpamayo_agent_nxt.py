@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import time
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dataclasses import dataclass
 from collections import deque
 from scipy.spatial.transform import Rotation
@@ -27,6 +27,13 @@ from .trajectory_optimizer_nxt import (
     VehicleConstraints,
     add_heading_to_trajectory,
     OptimizationResult,
+)
+from .control_state_nxt import (
+    ControlState,
+    ControlStateMachine,
+    build_transition_config,
+    load_pid_state_profile_bundle,
+    resolve_state_overrides,
 )
 
 # ---------------------------------------------------------------------------
@@ -110,6 +117,7 @@ class AgentConfig:
     pid_lon_kd: float = 0.0
     pid_max_throttle: float = 0.35
     pid_max_brake: float = 1.0
+    pid_state_config_path: Optional[str] = None  # JSON: CoT transitions + per-state PID overrides
 
     # Display
     enable_display: bool = True       # pygame dashboard window
@@ -741,6 +749,19 @@ class OfficialPIDTrajectoryFollower:
         self._curve_safe_speed: float = 999.0
         self._short_traj_count: int = 0
 
+    def apply_pid_overrides(self, overrides: Dict[str, float]) -> None:
+        """Apply runtime PID/profile overrides without recreating controllers."""
+        if "pid_target_speed_min_kmh" in overrides:
+            self._target_speed_min_kmh = float(overrides["pid_target_speed_min_kmh"])
+        if "pid_target_speed_max_kmh" in overrides:
+            self._target_speed_max_kmh = float(overrides["pid_target_speed_max_kmh"])
+        if "pid_target_speed_extent_gain" in overrides:
+            self._target_speed_extent_gain = float(overrides["pid_target_speed_extent_gain"])
+        if "pid_max_brake" in overrides:
+            self.pid.max_brake = float(overrides["pid_max_brake"])
+        if "pid_max_throttle" in overrides:
+            self.pid.max_throt = float(overrides["pid_max_throttle"])
+
     def set_trajectory(self, trajectory_xy: np.ndarray, headings: np.ndarray) -> None:
         self.trajectory = trajectory_xy
         self.headings = headings
@@ -926,6 +947,10 @@ class CarlaAlpamayoAgent:
         self.display: Optional[Display] = None
         self.traj_optimizer: Optional[TrajectoryOptimizer] = None
         self.nav_planner = None  # NavPlanner (Alpamayo 1.5 only)
+        self.control_state_machine: Optional[ControlStateMachine] = None
+        self.control_state: ControlState = ControlState.GO
+        self.pid_state_bundle: Optional[Dict[str, Any]] = None
+        self._pid_state_fallback: Dict[str, float] = {}
 
         # Ego-history ring buffer (world-frame poses)
         self.ego_history: deque[EgoPose] = deque(maxlen=512)
@@ -1235,6 +1260,26 @@ class CarlaAlpamayoAgent:
 
         control_mode = self.config.control_mode.replace("-", "_").lower()
         if control_mode == "official_pid":
+            self._pid_state_fallback = {
+                "pid_target_speed_min_kmh": float(self.config.pid_target_speed_min_kmh),
+                "pid_target_speed_max_kmh": float(self.config.pid_target_speed_max_kmh),
+                "pid_target_speed_extent_gain": float(self.config.pid_target_speed_extent_gain),
+                "pid_max_throttle": float(self.config.pid_max_throttle),
+                "pid_max_brake": float(self.config.pid_max_brake),
+            }
+            if self.config.pid_state_config_path:
+                self.pid_state_bundle = load_pid_state_profile_bundle(
+                    self.config.pid_state_config_path
+                )
+                self.control_state_machine = ControlStateMachine(
+                    build_transition_config(self.pid_state_bundle)
+                )
+            else:
+                self.pid_state_bundle = {"states": {}}
+                self.control_state_machine = ControlStateMachine(
+                    build_transition_config(self.pid_state_bundle)
+                )
+            self.control_state = ControlState.GO
             self.follower = OfficialPIDTrajectoryFollower(
                 world=self.world,
                 vehicle=self.vehicle,
@@ -1256,8 +1301,14 @@ class CarlaAlpamayoAgent:
                 max_throttle=self.config.pid_max_throttle,
                 max_brake=self.config.pid_max_brake,
             )
+            self._apply_pid_profile_for_state(self.control_state)
+            state_cfg = self.config.pid_state_config_path or "(embedded defaults)"
             print("Control mode: official_pid (CARLA VehiclePIDController)")
+            print(f"Control-state profile: {state_cfg} (state={self.control_state.value})")
         else:
+            self.control_state_machine = None
+            self.pid_state_bundle = None
+            self.control_state = ControlState.GO
             self.follower = TrajectoryFollower(
                 lookahead_distance=self.config.lookahead_distance,
                 max_speed_kmh=self.config.max_speed_kmh,
@@ -1521,9 +1572,45 @@ class CarlaAlpamayoAgent:
             return (now - self._last_inference_submit_wall_time) >= sec_interval
         return (self.tick_count % self.config.inference_interval) == 0
 
+    @staticmethod
+    def _build_cot_text(output: AlpamayoOutput) -> str:
+        """Build a normalized CoT text used for state classification."""
+        parts = []
+        if output.meta_action:
+            parts.append(output.meta_action.strip())
+        if output.reasoning:
+            parts.append(output.reasoning.strip())
+        return " ".join(parts).strip()
+
+    def _apply_pid_profile_for_state(self, state: ControlState) -> None:
+        """Apply per-state PID parameters to official PID follower."""
+        if self.pid_state_bundle is None:
+            return
+        if not isinstance(self.follower, OfficialPIDTrajectoryFollower):
+            return
+        overrides = resolve_state_overrides(
+            self.pid_state_bundle,
+            state,
+            self._pid_state_fallback,
+        )
+        self.follower.apply_pid_overrides(overrides)
+        self.control_state = state
+
+    def _update_control_state(self, output: AlpamayoOutput) -> None:
+        """Run CoT-based state transition and apply PID overrides on change."""
+        if self.control_state_machine is None:
+            return
+        cot_text = self._build_cot_text(output)
+        changed = self.control_state_machine.update_from_text(cot_text)
+        next_state = self.control_state_machine.state
+        if changed:
+            print(f"[state] {self.control_state.value} -> {next_state.value}")
+            self._apply_pid_profile_for_state(next_state)
+
     def _apply_inference_result(self, output: AlpamayoOutput) -> None:
         """Apply inference result to active trajectory/control state."""
         self.last_output = output
+        self._update_control_state(output)
 
         # ── Trajectory optimisation (optional) ──
         traj_xy = output.trajectory_xy
@@ -1716,6 +1803,8 @@ class CarlaAlpamayoAgent:
                 "throttle", "brake", "steer_out",
                 # Stop intent
                 "standstill_ticks", "short_traj_count", "model_wants_stop",
+                # State machine
+                "control_state",
                 # Navigation
                 "nav_text",
                 # CoT
@@ -1842,6 +1931,7 @@ class CarlaAlpamayoAgent:
                     print(
                         f"Tick {tick:5d} | Inf #{self.inference_count:4d} "
                         f"({self.last_inference_time:.2f}s) | "
+                        f"State {self.control_state.value:>4s} | "
                         f"Spd {st['speed_kmh']:5.1f} | "
                         f"Thr {ctrl.throttle:.2f} Brk {ctrl.brake:.2f} Str {steer_ema:+.2f} | "
                         f"Raw {ds_raw:.2f} EMA {ds:.2f}m/s TrjL {tl:.1f}m{vote_tag}{curv_tag}{hdg_tag}{opt_tag}{nudge_tag}{nav_tag} | {cot}"
@@ -1878,6 +1968,7 @@ class CarlaAlpamayoAgent:
                         f"{ctrl2.throttle:.3f}", f"{ctrl2.brake:.3f}", f"{ctrl2.steer:.4f}",
                         f._standstill_ticks, f._short_traj_count,
                         int(f._short_traj_count >= 3),
+                        self.control_state.value,
                         self.last_nav_text or "",
                         cot_text,
                     ])

@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import sys
+from pathlib import Path
 
 sys.path.insert(0, "..")
 sys.path.insert(0, "../src")
@@ -28,6 +29,9 @@ from src.carla_alpamayo_agent_nxt import CarlaAlpamayoAgent, AgentConfig
 
 
 def main():
+    default_pid_state_cfg = (
+        Path(__file__).resolve().parents[1] / "config" / "pid_state_profiles.json"
+    )
     parser = argparse.ArgumentParser(description="Run CARLA Alpamayo Agent (NXT)")
     parser.add_argument("--host", default="localhost", help="CARLA server host")
     parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
@@ -268,7 +272,22 @@ def main():
         "--pid-max-brake", type=float, default=1.0,
         help="Official PID max brake",
     )
+    parser.add_argument(
+        "--pid-state-config", type=str, default=str(default_pid_state_cfg),
+        help="JSON file for CoT state transitions and per-state PID overrides",
+    )
     args = parser.parse_args()
+
+    if args.record:
+        record_path = Path(args.record).expanduser()
+        if record_path.exists():
+            ans = input(
+                f"Record file already exists: {record_path}\n"
+                "Overwrite? [y/N]: "
+            ).strip().lower()
+            if ans != "y":
+                print("Canceled by user.")
+                return
 
     # Recording requires the display to be enabled
     if args.record and args.no_display:
@@ -337,6 +356,7 @@ def main():
         pid_lon_kd=args.pid_lon_kd,
         pid_max_throttle=args.pid_max_throttle,
         pid_max_brake=args.pid_max_brake,
+        pid_state_config_path=args.pid_state_config,
     )
 
     with CarlaAlpamayoAgent(config) as agent:
