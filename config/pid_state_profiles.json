@@ -1,0 +1,39 @@
+{
+  "transition": {
+    "confirm_count": 2,
+    "stop_patterns": [
+      "\\bstop\\b",
+      "\\bbrake\\b",
+      "\\bdecelerat(e|ing)\\b",
+      "\\bslow\\s+down\\b",
+      "\\bslow\\s+to\\b",
+      "\\bprepare\\s+to\\s+stop\\b",
+      "\\bwait\\b",
+      "\\bhold\\b",
+      "\\bred light\\b",
+      "\\byellow traffic light\\b",
+      "\\btraffic signal\\b",
+      "\\bfront vehicle\\b"
+    ],
+    "go_patterns": [
+      "\\bkeep\\b",
+      "\\bgo\\b",
+      "\\bproceed\\b",
+      "\\bcontinue\\b",
+      "\\bmove\\b",
+      "\\bdrive\\b",
+      "\\baccelerat(e|ing)\\b",
+      "\\bresume\\b"
+    ]
+  },
+  "states": {
+    "GO": {
+      "pid_target_speed_min_kmh": 10.0,
+      "pid_max_brake": 1.0
+    },
+    "STOP": {
+      "pid_target_speed_min_kmh": 0.0,
+      "pid_max_brake": 1.0
+    }
+  }
+}
