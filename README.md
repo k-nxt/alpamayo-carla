@@ -43,18 +43,15 @@ docker run --privileged --gpus all --net=host \
 
 ### 2. Python 仮想環境のセットアップ
 
-Alpamayo-R1 の依存関係を含む venv を使用します：
+Alpamayo-R1 の依存関係を含む venv にCARLAを追加して使用します（Alpamayo1.5も同様です）：
 
 ```bash
-# Alpamayo リポジトリをクローン
-git clone https://github.com/NVIDIA/alpamayo.git /path/to/alpamayo
+# Alpamayo リポジトリをクローンし、READMEなどもに従いvenv環境を作成しておく
+git clone https://github.com/NVIDIA/alpamayo.git
 
-# venv 作成 & 有効化
-python3.12 -m venv /path/to/alpamayo/ar1_venv
+# venv 有効化
 source /path/to/alpamayo/ar1_venv/bin/activate
 
-# Alpamayo-R1 パッケージのインストール（editable mode）
-uv pip install -e /path/to/alpamayo
 
 # CARLA Python クライアント
 uv pip install carla==0.9.16  # サーバーに合わせる（Python 3.12 は 0.9.16 のみ対応）
