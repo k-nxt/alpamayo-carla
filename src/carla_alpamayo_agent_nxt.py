@@ -17,6 +17,7 @@ import threading
 from typing import Dict, Optional, Any
 from dataclasses import dataclass
 from collections import deque
+from types import SimpleNamespace
 from scipy.spatial.transform import Rotation
 
 from .alpamayo_wrapper_nxt import AlpamayoWrapper, AlpamayoOutput, detect_model_version, VERSION_15
@@ -118,6 +119,7 @@ class AgentConfig:
     pid_max_throttle: float = 0.35
     pid_max_brake: float = 1.0
     pid_state_config_path: Optional[str] = None  # JSON: CoT transitions + per-state PID overrides
+    map_correction: bool = True       # snap PID target to nearest CARLA map waypoint (legacy default)
 
     # Display
     enable_display: bool = True       # pygame dashboard window
@@ -708,12 +710,14 @@ class OfficialPIDTrajectoryFollower:
         lon_kd: float = 0.0,
         max_throttle: float = 0.35,
         max_brake: float = 1.0,
+        map_correction: bool = True,
     ):
         from agents.navigation.controller import VehiclePIDController
 
         self.world = world
         self.map = world.get_map()
         self.vehicle = vehicle
+        self._map_correction = map_correction
 
         self.max_speed_ms = max_speed_kmh / 3.6
         self.min_speed_ms = min_speed_kmh / 3.6
@@ -818,13 +822,18 @@ class OfficialPIDTrajectoryFollower:
             y=float(traj_world[target_idx, 1]),
             z=float(traj_world[target_idx, 2]),
         )
-        target_wp = self.map.get_waypoint(
-            target_loc, project_to_road=True, lane_type=carla.LaneType.Driving
-        )
-        if target_wp is None:
-            ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.3)
-            self._last_control = ctrl
-            return ctrl
+        if self._map_correction:
+            target_wp = self.map.get_waypoint(
+                target_loc, project_to_road=True, lane_type=carla.LaneType.Driving
+            )
+            if target_wp is None:
+                ctrl = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.3)
+                self._last_control = ctrl
+                return ctrl
+        else:
+            target_wp = SimpleNamespace(
+                transform=carla.Transform(location=target_loc)
+            )
 
         traj_extent = float(np.max(np.linalg.norm(traj_local[:, :2], axis=1)))
         target_speed_kmh = float(np.clip(
@@ -1300,10 +1309,12 @@ class CarlaAlpamayoAgent:
                 lon_kd=self.config.pid_lon_kd,
                 max_throttle=self.config.pid_max_throttle,
                 max_brake=self.config.pid_max_brake,
+                map_correction=self.config.map_correction,
             )
             self._apply_pid_profile_for_state(self.control_state)
             state_cfg = self.config.pid_state_config_path or "(embedded defaults)"
             print("Control mode: official_pid (CARLA VehiclePIDController)")
+            print(f"Map correction: {'ON' if self.config.map_correction else 'OFF'}")
             print(f"Control-state profile: {state_cfg} (state={self.control_state.value})")
         else:
             self.control_state_machine = None

@@ -276,6 +276,11 @@ def main():
         "--pid-state-config", type=str, default=str(default_pid_state_cfg),
         help="JSON file for CoT state transitions and per-state PID overrides",
     )
+    parser.add_argument(
+        "--no-map-correction", action="store_true",
+        help="Disable snapping PID target to CARLA map waypoint "
+             "(use raw Alpamayo trajectory point; matches 'pure Alpamayo' evaluation)",
+    )
     args = parser.parse_args()
 
     if args.record:
@@ -357,6 +362,7 @@ def main():
         pid_max_throttle=args.pid_max_throttle,
         pid_max_brake=args.pid_max_brake,
         pid_state_config_path=args.pid_state_config,
+        map_correction=not args.no_map_correction,
     )
 
     with CarlaAlpamayoAgent(config) as agent:
