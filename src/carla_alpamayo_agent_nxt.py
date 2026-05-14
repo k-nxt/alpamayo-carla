@@ -120,6 +120,7 @@ class AgentConfig:
     pid_max_brake: float = 1.0
     pid_state_config_path: Optional[str] = None  # JSON: CoT transitions + per-state PID overrides
     map_correction: bool = True       # snap PID target to nearest CARLA map waypoint (legacy default)
+    map_load_timeout: float = 180.0   # client timeout (s) used only during load_world (cold-start map switch can take >60s)
 
     # Display
     enable_display: bool = True       # pygame dashboard window
@@ -1004,8 +1005,9 @@ class CarlaAlpamayoAgent:
             target = self.config.map_name
             # CARLA map names may include a path prefix (e.g. "Carla/Maps/Town03")
             if not current_map.endswith(target):
-                print(f"Loading map {target} (current: {current_map})...")
-                self.client.set_timeout(60.0)  # map load can be slow
+                print(f"Loading map {target} (current: {current_map}) "
+                      f"with timeout {self.config.map_load_timeout}s...")
+                self.client.set_timeout(self.config.map_load_timeout)
                 self.world = self.client.load_world(target)
                 self.client.set_timeout(self.config.timeout)
             else:

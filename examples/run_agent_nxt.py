@@ -281,6 +281,11 @@ def main():
         help="Disable snapping PID target to CARLA map waypoint "
              "(use raw Alpamayo trajectory point; matches 'pure Alpamayo' evaluation)",
     )
+    parser.add_argument(
+        "--map-load-timeout", type=float, default=180.0,
+        help="CARLA client timeout used only during load_world() (default 180s; "
+             "cold-start map switch to heavy towns can take >60s)",
+    )
     args = parser.parse_args()
 
     if args.record:
@@ -363,6 +368,7 @@ def main():
         pid_max_brake=args.pid_max_brake,
         pid_state_config_path=args.pid_state_config,
         map_correction=not args.no_map_correction,
+        map_load_timeout=args.map_load_timeout,
     )
 
     with CarlaAlpamayoAgent(config) as agent:
