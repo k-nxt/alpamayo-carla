@@ -68,7 +68,7 @@ class AgentConfig:
     # CARLA connection
     host: str = "localhost"
     port: int = 2000
-    timeout: float = 10.0
+    timeout: float = 30.0           # CARLA RPC default timeout (sensor spawn 等で 10s 不足のことがある)
     map_name: Optional[str] = None  # e.g. "Town03" — None = keep current map
     weather: str = "ClearNoon"      # weather preset name (see WEATHER_PRESETS)
 

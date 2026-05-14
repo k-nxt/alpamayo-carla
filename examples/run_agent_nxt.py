@@ -286,6 +286,11 @@ def main():
         help="CARLA client timeout used only during load_world() (default 180s; "
              "cold-start map switch to heavy towns can take >60s)",
     )
+    parser.add_argument(
+        "--timeout", type=float, default=30.0,
+        help="CARLA RPC default timeout in seconds (default 30s; "
+             "increase if sensor spawn or other RPC calls time out at 10s)",
+    )
     args = parser.parse_args()
 
     if args.record:
@@ -369,6 +374,7 @@ def main():
         pid_state_config_path=args.pid_state_config,
         map_correction=not args.no_map_correction,
         map_load_timeout=args.map_load_timeout,
+        timeout=args.timeout,
     )
 
     with CarlaAlpamayoAgent(config) as agent:
